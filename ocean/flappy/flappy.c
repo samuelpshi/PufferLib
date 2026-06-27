@@ -6,7 +6,42 @@
  * simple, it does not include C neural nets. See Target for that.
  */
 
+#include <stdlib.h>
 #include "flappy.h"
+
+void demo() {
+    Flappy env = {.rng = 42};
+    env.observations = (float*)calloc(6, sizeof(float));  // bumped from 1 → 6
+    env.actions = (float*)calloc(1, sizeof(float));
+    env.rewards = (float*)calloc(1, sizeof(float));
+    env.terminals = (float*)calloc(1, sizeof(float));
+
+    c_reset(&env);
+    c_render(&env);
+    while (!WindowShouldClose()) {
+        
+        env.actions[0] = 0.0f;
+        if (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_W)) env.actions[0] = FLAP;
+
+        c_step(&env);
+        c_render(&env);
+    }
+
+    free(env.observations);
+    free(env.actions);
+    free(env.rewards);
+    free(env.terminals);
+    c_close(&env);
+}
+
+int main() {
+    demo();
+    return 0;
+}
+
+
+
+ /*#include "flappy.h"
 #include "puffernet.h"
 
 void demo() {
@@ -50,3 +85,5 @@ int main() {
     demo();
     return 0;
 }
+
+*/

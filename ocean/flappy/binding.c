@@ -1,5 +1,5 @@
 #include "flappy.h"
-#define OBS_SIZE 1
+#define OBS_SIZE 6
 #define NUM_ATNS 1
 #define ACT_SIZES {2}
 #define OBS_TENSOR_T FloatTensor
