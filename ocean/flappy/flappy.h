@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "raylib.h"
+#include <stdio.h>
 
 #define SCREEN_WIDTH 430
 #define SCREEN_HEIGHT 512
@@ -87,6 +88,8 @@ void c_reset(Flappy* env) {
 
 // Required function
 void c_step(Flappy* env) {
+    printf("tick=%d y=%.1f vy=%.1f px0=%.1f\n", env->tick, env->y, env->vy, env->pipe_x[0]);
+    fflush(stdout);
     env->tick += 1;
     int action = (int)env->actions[0];
     env->terminals[0] = 0;
