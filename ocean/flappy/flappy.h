@@ -49,7 +49,7 @@ typedef struct {
     float y;       // bird vertical position
     float vy;       // bird vertical velocity
     float ep_return;
-
+    float pipes_passed;
     float pipe_x[3];     // x position of each pipe
     float pipe_gap_y[3];  // y-center (or top) of the gap for each pipe
 
@@ -57,8 +57,8 @@ typedef struct {
 } Flappy;
 
 void add_log(Flappy* env) {
-    env->log.perf += (env->rewards[0] > 0) ? 1 : 0;
-    env->log.score += env->rewards[0];
+    env->log.perf += env->pipes_passed / 50.0f;
+    env->log.score += env->pipes_passed;
     env->log.episode_length += env->tick;
     env->log.episode_return += env->ep_return;
     env->log.n++;
@@ -73,7 +73,7 @@ void c_reset(Flappy* env) {
     env->y = SCREEN_HEIGHT/2;
     env->vy = 0.0f;
     env->ep_return = 0.0f;
-
+    env->pipes_passed = 0.0f;
     env->pipe_x[0] = PIPE_LEAD_IN;
     env->pipe_x[1] = env->pipe_x[0] + PIPE_SPACING;
     env->pipe_x[2] = env->pipe_x[1] + PIPE_SPACING;
@@ -96,7 +96,7 @@ void c_step(Flappy* env) {
     env->tick += 1;
     int action = (int)env->actions[0];
     env->terminals[0] = 0;
-    env->rewards[0] = 0.1;
+    env->rewards[0] = 0.01;
 
     if (action == FLAP) {
         env->vy = FLAP_IMPULSE;  // negative constant
@@ -112,7 +112,7 @@ void c_step(Flappy* env) {
 
     if (env->pipe_x[0] + PIPE_WIDTH < BIRD_X) {
         env->rewards[0] = 1.0;
-
+        env->pipes_passed += 1.0f;
         env->pipe_x[0] = env->pipe_x[1];
         env->pipe_x[1] = env->pipe_x[2];
         env->pipe_x[2] = env->pipe_x[1] + PIPE_SPACING;
@@ -139,7 +139,7 @@ void c_step(Flappy* env) {
         c_reset(env);
         return;
     }
-    
+
     env->observations[0] = env->y / SCREEN_HEIGHT;
     env->observations[1] = env->vy;
     env->observations[2] = env->pipe_x[0] / SCREEN_WIDTH;
