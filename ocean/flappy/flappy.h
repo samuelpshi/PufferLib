@@ -29,9 +29,11 @@
 // add_log would eventually stop firing and every metric would go stale.
 #define MAX_TICKS 5000
 
-// Target pipe count used to normalize perf into [0, 1]. ~500 gives a strong
-// agent (~460 baseline) headroom above 0.9 without flattening the objective.
-#define PERF_TARGET 500.0f
+// Max pipes reachable within MAX_TICKS: the first pipe clears once it has
+// travelled (PIPE_LEAD_IN + PIPE_WIDTH - BIRD_X) px, then one per PIPE_SPACING.
+#define TICKS_TO_FIRST_PIPE ((int)((PIPE_LEAD_IN + PIPE_WIDTH - BIRD_X) / SCROLL_SPEED))
+#define TICKS_PER_PIPE ((int)(PIPE_SPACING / SCROLL_SPEED))
+#define PERF_TARGET ((float)(1 + (MAX_TICKS - TICKS_TO_FIRST_PIPE) / TICKS_PER_PIPE))
 
 #define MIN_GAP_Y (GAP_HEIGHT/2 + GAP_HEIGHT)
 #define MAX_GAP_Y (SCREEN_HEIGHT - GAP_HEIGHT/2 - GAP_HEIGHT)
