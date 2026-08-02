@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "raylib.h"
+#include <math.h>
 #include <stdio.h>
 
 #define SCREEN_WIDTH 430
