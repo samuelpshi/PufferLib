@@ -66,6 +66,7 @@ typedef struct {
     float pipe_gap_y[3];  // y-center (or top) of the gap for each pipe
 
     unsigned int rng;
+    Texture2D bird_texture;
 } Flappy;
 
 void add_log(Flappy* env) {
@@ -173,6 +174,7 @@ void c_render(Flappy* env) {
     if (!IsWindowReady()) {
         InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "PufferLib Flappy");
         SetTargetFPS(30);
+        env->bird_texture = LoadTexture("resources/shared/puffers_128.png");
     }
 
     if (IsKeyDown(KEY_ESCAPE)) {
@@ -185,13 +187,14 @@ void c_render(Flappy* env) {
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
 
-    // Draw bird as a rectangle centered on (BIRD_X, env->y)
-    DrawRectangle(
-        BIRD_X - BIRD_WIDTH/2,
-        (int)(env->y) - BIRD_HEIGHT/2,
-        BIRD_WIDTH,
-        BIRD_HEIGHT,
-        (Color){0, 187, 187, 255}
+    float tilt = fminf(fmaxf(env->vy * 3.0f, -30.0f), 45.0f);
+    DrawTexturePro(
+        env->bird_texture,
+        (Rectangle){0, 0, 128, 128},
+        (Rectangle){BIRD_X, env->y, BIRD_WIDTH, BIRD_HEIGHT},
+        (Vector2){BIRD_WIDTH/2.0f, BIRD_HEIGHT/2.0f},
+        tilt,
+        WHITE
     );
 
     // Draw all 3 pipes — top and bottom rectangles per pipe
@@ -221,6 +224,7 @@ void c_render(Flappy* env) {
 // Do not free env->observations, actions, rewards, terminals
 void c_close(Flappy* env) {
     if (IsWindowReady()) {
+        UnloadTexture(env->bird_texture);
         CloseWindow();
     }
 }
