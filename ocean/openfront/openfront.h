@@ -2,7 +2,6 @@
    (github.com/openfrontio/OpenFrontIO, AGPL-3.0), commit fc50009.
    Independent C implementation; no source transliterated. */
 
-#!/bin/bash
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
