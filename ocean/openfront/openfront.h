@@ -18,9 +18,9 @@ typedef float obs_t;
 #define OBS_SIZE  31
 _Static_assert(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 
-#define W 48
-#define H 48
-#define N (W*H)
+#define OF_W 48
+#define OF_H 48
+#define OF_N (OF_W*OF_H)
 #define MAXP 9
 #define MAXATK 32
 
@@ -42,8 +42,8 @@ _Static_assert(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 // types
 
 typedef struct {
-    int tiles[N];
-    int pos[N];
+    int tiles[OF_N];
+    int pos[OF_N];
     int count;
 } TileSet;
 
@@ -110,8 +110,8 @@ struct Env {
     int steps;
     int agent_is_bot;
 
-    unsigned char  terrain[N];
-    unsigned short owner[N];
+    unsigned char  terrain[OF_N];
+    unsigned short owner[OF_N];
     int  land_tiles;
     long ticks;
 
@@ -126,17 +126,17 @@ struct Env {
     Bot    bots[MAXP];
     int    spawn_center[MAXP];
 
-    unsigned int cl_visited[N];
+    unsigned int cl_visited[OF_N];
     unsigned int cl_gen;
-    int cl_stack[N];
-    int cl_comp[N];
-    int cl_start[N];
-    int cl_size[N];
+    int cl_stack[OF_N];
+    int cl_comp[OF_N];
+    int cl_start[OF_N];
+    int cl_size[OF_N];
 
-    unsigned int ff_visited[N];
+    unsigned int ff_visited[OF_N];
     unsigned int ff_gen;
-    int ff_stack[N];
-    int ff_take[N];
+    int ff_stack[OF_N];
+    int ff_take[OF_N];
 
     long annex_events;
     long annex_by[MAXP];
@@ -148,9 +148,9 @@ struct Env {
 
 // helpers
 
-static int ref(int x, int y) { return y*W + x; }
-static int rx(int r) { return r % W; }
-static int ry(int r) { return r / W; }
+static int ref(int x, int y) { return y*OF_W + x; }
+static int rx(int r) { return r % OF_W; }
+static int ry(int r) { return r / OF_W; }
 
 static float within(float v, float lo, float hi) {
     if (v < lo) return lo;
@@ -160,26 +160,26 @@ static float within(float v, float lo, float hi) {
 
 static int neighbors(int r, int *out) {
     int n = 0;
-    if (ry(r) != 0)   out[n++] = r-W;
-    if (ry(r) != H-1) out[n++] = r+W;
+    if (ry(r) != 0)   out[n++] = r-OF_W;
+    if (ry(r) != OF_H-1) out[n++] = r+OF_W;
     if (rx(r) != 0)   out[n++] = r-1;
-    if (rx(r) != W-1) out[n++] = r+1;
+    if (rx(r) != OF_W-1) out[n++] = r+1;
     return n;
 }
 
 static int neighbors8(int r, int *out) {
-    int x = r % W, y = r / W, n = 0;
-    int up = (y != 0), dn = (y != H-1), lf = (x != 0), rt = (x != W-1);
-    if (up) { if (lf) out[n++] = r-W-1; out[n++] = r-W; if (rt) out[n++] = r-W+1; }
+    int x = r % OF_W, y = r / OF_W, n = 0;
+    int up = (y != 0), dn = (y != OF_H-1), lf = (x != 0), rt = (x != OF_W-1);
+    if (up) { if (lf) out[n++] = r-OF_W-1; out[n++] = r-OF_W; if (rt) out[n++] = r-OF_W+1; }
     if (lf) out[n++] = r-1;
     if (rt) out[n++] = r+1;
-    if (dn) { if (lf) out[n++] = r+W-1; out[n++] = r+W; if (rt) out[n++] = r+W+1; }
+    if (dn) { if (lf) out[n++] = r+OF_W-1; out[n++] = r+OF_W; if (rt) out[n++] = r+OF_W+1; }
     return n;
 }
 
 static int on_map_edge(int t) {
     int x = rx(t), y = ry(t);
-    return x == 0 || x == W-1 || y == 0 || y == H-1;
+    return x == 0 || x == OF_W-1 || y == 0 || y == OF_H-1;
 }
 
 // rng
@@ -222,22 +222,22 @@ static int is_shore(Env *e, int t) {
 
 static void fill_terrain(Env *e) {
     e->land_tiles = 0;
-    for (int r = 0; r < N; r++) {
-        if (ry(r) == 0 || ry(r) == H-1 || rx(r) == 0 || rx(r) == W-1)
+    for (int r = 0; r < OF_N; r++) {
+        if (ry(r) == 0 || ry(r) == OF_H-1 || rx(r) == 0 || rx(r) == OF_W-1)
             e->terrain[r] = 0;
         else
             e->terrain[r] = 1;
     }
 
     for (int i = 0; i < 15; i++) {
-        int cx  = rng_below(e, W);
-        int cy  = rng_below(e, H);
+        int cx  = rng_below(e, OF_W);
+        int cy  = rng_below(e, OF_H);
         int rad = 4 + rng_below(e, 8);
         int inner = rad * 2 / 3;
 
         for (int y = cy-rad; y <= cy+rad; y++) {
             for (int x = cx-rad; x <= cx+rad; x++) {
-                if (x < 0 || x >= W || y < 0 || y >= H) continue;
+                if (x < 0 || x >= OF_W || y < 0 || y >= OF_H) continue;
                 int r = ref(x, y);
                 if (e->terrain[r] == 0) continue;
                 int dx = x - cx;
@@ -248,13 +248,13 @@ static void fill_terrain(Env *e) {
             }
         }
     }
-    for (int r = 0; r < N; r++)
+    for (int r = 0; r < OF_N; r++)
         if (e->terrain[r] != 0) e->land_tiles++;
 }
 
 static void print_owner(Env *e) {
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
+    for (int y = 0; y < OF_H; y++) {
+        for (int x = 0; x < OF_W; x++) {
             int r = ref(x, y);
             if (e->terrain[r] == 0)    putchar('~');
             else if (e->owner[r] == 0) putchar('.');
@@ -268,7 +268,7 @@ static void print_owner(Env *e) {
 
 static void ts_init(TileSet *s) {
     s->count = 0;
-    for (int i = 0; i < N; i++) s->pos[i] = -1;
+    for (int i = 0; i < OF_N; i++) s->pos[i] = -1;
 }
 
 static void ts_add(TileSet *s, int t) {
@@ -607,8 +607,8 @@ static void attack_tick(Env *e, Attack *a) {
 // annexation (spec 9)
 
 static int annex_surrounded(Env *e, int p, const int *tiles, int n, int largest) {
-    int cminx = W, cmaxx = -1, cminy = H, cmaxy = -1;
-    int eminx = W, emaxx = -1, eminy = H, emaxy = -1;
+    int cminx = OF_W, cmaxx = -1, cminy = OF_H, cmaxy = -1;
+    int eminx = OF_W, emaxx = -1, eminy = OF_H, emaxy = -1;
     int seen[MAXP];
     int distinct = 0;
     memset(seen, 0, sizeof(seen));
@@ -938,7 +938,7 @@ static int spawn_disk_ok(Env *e, int cx, int cy) {
         for (int dx = -SPAWN_RADIUS; dx <= SPAWN_RADIUS; dx++) {
             if (dx*dx + dy*dy > SPAWN_RADIUS*SPAWN_RADIUS) continue;
             int x = cx + dx, y = cy + dy;
-            if (x < 0 || x >= W || y < 0 || y >= H) return 0;
+            if (x < 0 || x >= OF_W || y < 0 || y >= OF_H) return 0;
             int t = ref(x, y);
             if (e->terrain[t] == 0) return 0;
             if (e->owner[t]  != 0) return 0;
@@ -949,7 +949,7 @@ static int spawn_disk_ok(Env *e, int cx, int cy) {
 
 static int spawn_place(Env *e, int p) {
     for (int attempt = 0; attempt < SPAWN_TRIES; attempt++) {
-        int cx = rng_below(e, W), cy = rng_below(e, H);
+        int cx = rng_below(e, OF_W), cy = rng_below(e, OF_H);
         int c  = ref(cx, cy);
 
         if (e->terrain[c] == 0 || e->owner[c] != 0) continue;
@@ -1051,7 +1051,7 @@ static void ts_check(TileSet *s) {
 }
 
 static void check_borders(Env *e) {
-    for (int t = 0; t < N; t++) {
+    for (int t = 0; t < OF_N; t++) {
         int p = e->owner[t];
         if (p == 0) continue;
         int nb[4], n = neighbors(t, nb), should = 0;
@@ -1099,7 +1099,7 @@ static Env *test_env(unsigned int seed) {
 }
 
 static TileSet test_set;
-static int test_present[N];
+static int test_present[OF_N];
 
 static void ts_test(void) {
     ts_init(&test_set);
@@ -1107,7 +1107,7 @@ static void ts_test(void) {
     int n_present = 0;
 
     for (int step = 0; step < 200000; step++) {
-        int t = rand() % N;
+        int t = rand() % OF_N;
         if (rand() % 2) {
             ts_add(&test_set, t);
             if (!test_present[t]) { test_present[t] = 1; n_present++; }
@@ -1135,7 +1135,7 @@ static void conquer_test(void) {
     players_reset(e);
     for (int step = 0; step < 50000; step++) {
         int p = 1 + rand() % (MAXP - 1);
-        int t = rand() % N;
+        int t = rand() % OF_N;
         conquer(e, p, t);
         if (step % 500 == 0) check_borders(e);
     }
@@ -1189,7 +1189,7 @@ static void heap_test(void) {
 
     int n_push = HEAPCAP;
     for (int i = 0; i < n_push; i++)
-        heap_push(e, h, i % N, (float)(rand() % 100000));
+        heap_push(e, h, i % OF_N, (float)(rand() % 100000));
 
     float prev = -1.0f;
     int popped = 0;
@@ -1206,7 +1206,7 @@ static void heap_test(void) {
     heap_init(h);
     for (int step = 0; step < 100000; step++) {
         if (h->count == 0 || rand() % 2)
-            heap_push(e, h, rand() % N, (float)(rand() % 1000));
+            heap_push(e, h, rand() % OF_N, (float)(rand() % 1000));
         else
             heap_pop(h);
         for (int i = 0; i < h->count; i++) {
@@ -1298,7 +1298,7 @@ static void annex_test(void) {
 static void attack_test(void) {
     Env *e = test_env(5);
     memset(e->terrain, 1, sizeof(e->terrain));
-    e->land_tiles = N;
+    e->land_tiles = OF_N;
     players_reset(e);
     bots_init(e);
     for (int i = 0; i < MAXATK; i++) e->attacks[i].active = 0;
@@ -1324,7 +1324,7 @@ static void attack_test(void) {
 
 static unsigned long env_hash(Env *e) {
     unsigned long h = 1469598103934665603UL;
-    for (int t = 0; t < N; t++) {
+    for (int t = 0; t < OF_N; t++) {
         h = (h ^ e->owner[t]) * 1099511628211UL;
         h = (h ^ e->terrain[t]) * 1099511628211UL;
     }
@@ -1600,7 +1600,7 @@ void puf_step(Env *e) {
 void puf_render(Env *e) {
     const int CELL = 14;
     if (!IsWindowReady()) {
-        InitWindow(W*CELL, H*CELL, "OpenFront");
+        InitWindow(OF_W*CELL, OF_H*CELL, "OpenFront");
         SetTargetFPS(30);
     }
     if (IsKeyDown(KEY_ESCAPE)) exit(0);
@@ -1611,7 +1611,7 @@ void puf_render(Env *e) {
     };
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
-    for (int t = 0; t < N; t++) {
+    for (int t = 0; t < OF_N; t++) {
         Color c;
         if (e->terrain[t] == 0)      c = (Color){20, 40, 70, 255};
         else if (e->owner[t] == 0)   c = (Color){60, 70, 60, 255};
