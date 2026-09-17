@@ -2,6 +2,7 @@
    (github.com/openfrontio/OpenFrontIO, AGPL-3.0), commit fc50009.
    Independent C implementation; no source transliterated. */
 
+#!/bin/bash
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +17,12 @@ typedef float obs_t;
 #define ACT_SIZES {7}
 #define NUM_ATNS  1
 #define OBS_SIZE  31
-_Static_assert(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
+#ifdef __cplusplus
+#define OF_STATIC_ASSERT static_assert
+#else
+#define OF_STATIC_ASSERT _Static_assert
+#endif
+OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 
 #define OF_W 48
 #define OF_H 48
