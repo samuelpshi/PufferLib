@@ -90,6 +90,10 @@ struct Log {
     float episode_length;
     float win;
     float annexations;
+    float won;
+    float eliminated;
+    float rival_won;
+    float timeout;
     float n;
 };
 
@@ -216,12 +220,34 @@ static int rng_int(Env *e, int lo, int hi) {
 
 // map
 
+#define OF_LAND_BIT  0x80
+#define OF_SHORE_BIT 0x40
+#define OF_OCEAN_BIT 0x20
+#define OF_MAG_MASK  0x1F
+
+static int is_land(Env *e, int t)      { return e->terrain[t] & OF_LAND_BIT; }
+static int is_ocean(Env *e, int t)     { return e->terrain[t] & OF_OCEAN_BIT; }
+static int is_shoreline(Env *e, int t) { return e->terrain[t] & OF_SHORE_BIT; }
+static int magnitude(Env *e, int t)    { return e->terrain[t] & OF_MAG_MASK; }
+
+/* 0 plains, 1 highland, 2 mountain. Land tiles only. */
+static int terrain_type(Env *e, int t) {
+    int m = magnitude(e, t);
+    if (m < 10) return 0;
+    if (m < 20) return 1;
+    return 2;
+}
+
 static int is_shore(Env *e, int t) {
-    if (e->terrain[t] == 0) return 0;
+    return is_land(e, t) && is_shoreline(e, t);
+}
+
+static int is_ocean_shore(Env *e, int t) {
+    if (!is_land(e, t)) return 0;
     int nb[4];
     int n = neighbors(t, nb);
     for (int i = 0; i < n; i++)
-        if (e->terrain[nb[i]] == 0) return 1;
+        if (is_ocean(e, nb[i])) return 1;
     return 0;
 }
 
@@ -231,7 +257,7 @@ static void fill_terrain(Env *e) {
         if (ry(r) == 0 || ry(r) == OF_H-1 || rx(r) == 0 || rx(r) == OF_W-1)
             e->terrain[r] = 0;
         else
-            e->terrain[r] = 1;
+            e->terrain[r] = OF_LAND_BIT | 5;
     }
 
     for (int i = 0; i < 15; i++) {
@@ -244,24 +270,38 @@ static void fill_terrain(Env *e) {
             for (int x = cx-rad; x <= cx+rad; x++) {
                 if (x < 0 || x >= OF_W || y < 0 || y >= OF_H) continue;
                 int r = ref(x, y);
-                if (e->terrain[r] == 0) continue;
+                if (!is_land(e, r)) continue;
                 int dx = x - cx;
                 int dy = y - cy;
                 int d2 = dx*dx + dy*dy;
                 if (d2 <= rad*rad)
-                    e->terrain[r] = (d2 <= inner*inner) ? 3 : 2;
+                    e->terrain[r] = OF_LAND_BIT | ((d2 <= inner*inner) ? 25 : 15);
             }
         }
     }
-    for (int r = 0; r < OF_N; r++)
-        if (e->terrain[r] != 0) e->land_tiles++;
+
+    for (int r = 0; r < OF_N; r++) {
+        if (is_land(e, r)) e->land_tiles++;
+        else               e->terrain[r] |= OF_OCEAN_BIT;
+    }
+
+    for (int r = 0; r < OF_N; r++) {
+        int nb[4];
+        int n = neighbors(r, nb);
+        int land = is_land(e, r) != 0;
+        for (int i = 0; i < n; i++)
+            if ((is_land(e, nb[i]) != 0) != land) {
+                e->terrain[r] |= OF_SHORE_BIT;
+                break;
+            }
+    }
 }
 
 static void print_owner(Env *e) {
     for (int y = 0; y < OF_H; y++) {
         for (int x = 0; x < OF_W; x++) {
             int r = ref(x, y);
-            if (e->terrain[r] == 0)    putchar('~');
+            if (!is_land(e, r))        putchar('~');
             else if (e->owner[r] == 0) putchar('.');
             else                       putchar('0' + e->owner[r]);
         }
@@ -366,7 +406,7 @@ static void update_border(Env *e, int t) {
 
 static void conquer(Env *e, int p, int t) {
 #ifdef DEBUG
-    if (e->terrain[t] == 0) {
+    if (!is_land(e, t)) {
         printf("CONQUER WATER: p%d tile %d\n", p, t);
         exit(1);
     }
@@ -443,11 +483,11 @@ static int find_free_slot(Env *e) {
 }
 
 static void atk_push(Env *e, Attack *a, int t) {
-    float mag;
-    if      (e->terrain[t] == 1) mag = 1.0f;
-    else if (e->terrain[t] == 2) mag = 1.5f;
-    else if (e->terrain[t] == 3) mag = 2.0f;
-    else                         mag = 0.0f;
+    float mag = 0.0f;
+    if (is_land(e, t)) {
+        int ty = terrain_type(e, t);
+        mag = (ty == 0) ? 1.0f : (ty == 1) ? 1.5f : 2.0f;
+    }
 
     int nb[4];
     int n = neighbors(t, nb);
@@ -511,7 +551,7 @@ static void attack_start(Env *e, int attacker, int target, float troops) {
         int nb[4];
         int n = neighbors(t, nb);
         for (int k = 0; k < n; k++) {
-            if (e->owner[nb[k]] == target && e->terrain[nb[k]] != 0)
+            if (e->owner[nb[k]] == target && is_land(e, nb[k]))
                 atk_push(e, a, nb[k]);
         }
     }
@@ -563,7 +603,7 @@ static void attack_tick(Env *e, Attack *a) {
         }
 
         if (e->owner[t] != a->target) continue;
-        if (e->terrain[t] == 0) continue;
+        if (!is_land(e, t)) continue;
         int nb[4];
         int n = neighbors(t, nb);
         int on_border = 0;
@@ -573,14 +613,15 @@ static void attack_tick(Env *e, Attack *a) {
         if (!on_border) continue;
 
         for (int k = 0; k < n; k++) {
-            if (e->owner[nb[k]] == a->target && e->terrain[nb[k]] != 0)
+            if (e->owner[nb[k]] == a->target && is_land(e, nb[k]))
                 atk_push(e, a, nb[k]);
         }
 
         float mag, speed;
-        if      (e->terrain[t] == 2) { mag = 100.0f; speed = 20.0f; }
-        else if (e->terrain[t] == 3) { mag = 120.0f; speed = 25.0f; }
-        else                         { mag = 80.0f;  speed = 16.5f; }
+        int ty = terrain_type(e, t);
+        if      (ty == 2) { mag = 120.0f; speed = 25.0f; }
+        else if (ty == 1) { mag = 100.0f; speed = 20.0f; }
+        else              { mag = 80.0f;  speed = 16.5f; }
 
         float atk_loss, cost;
         if (a->target == 0) {
@@ -672,7 +713,7 @@ static int annex_enclosed(Env *e, int p, int start) {
             if (e->ff_visited[u] == e->ff_gen) continue;
             int o = e->owner[u];
             if (o != 0 && o != p) continue;
-            if (o == 0 && e->terrain[u] == 0) return 0;
+            if (o == 0 && !is_land(e, u)) return 0;
             e->ff_visited[u] = e->ff_gen;
             e->ff_stack[sp++] = u;
         }
@@ -832,7 +873,7 @@ static int has_tn_neighbor(Env *e, int p) {
         int nb[4];
         int n = neighbors(t, nb);
         for (int k = 0; k < n; k++) {
-            if (e->owner[nb[k]] == 0 && e->terrain[nb[k]] != 0)
+            if (e->owner[nb[k]] == 0 && is_land(e, nb[k]))
                 return 1;
         }
     }
@@ -945,7 +986,7 @@ static int spawn_disk_ok(Env *e, int cx, int cy) {
             int x = cx + dx, y = cy + dy;
             if (x < 0 || x >= OF_W || y < 0 || y >= OF_H) return 0;
             int t = ref(x, y);
-            if (e->terrain[t] == 0) return 0;
+            if (!is_land(e, t)) return 0;
             if (e->owner[t]  != 0) return 0;
         }
     }
@@ -957,7 +998,7 @@ static int spawn_place(Env *e, int p) {
         int cx = rng_below(e, OF_W), cy = rng_below(e, OF_H);
         int c  = ref(cx, cy);
 
-        if (e->terrain[c] == 0 || e->owner[c] != 0) continue;
+        if (!is_land(e, c) || e->owner[c] != 0) continue;
 
         int nb[4];
         int n = neighbors(c, nb), touching = 0;
@@ -1136,7 +1177,7 @@ static void ts_test(void) {
 
 static void conquer_test(void) {
     Env *e = test_env(1);
-    memset(e->terrain, 1, sizeof(e->terrain));
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
     players_reset(e);
     for (int step = 0; step < 50000; step++) {
         int p = 1 + rand() % (MAXP - 1);
@@ -1161,7 +1202,7 @@ static void fill_rect(Env *e, int p, int x0, int y0, int w, int h) {
 
 static void blob_test(void) {
     Env *e = test_env(2);
-    memset(e->terrain, 1, sizeof(e->terrain));
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
     players_reset(e);
 
     for (int p = 1; p <= 4; p++) {
@@ -1237,7 +1278,7 @@ static void annex_force(Env *e, int p) {
 
 static void annex_test(void) {
     Env *e = test_env(4);
-    memset(e->terrain, 1, sizeof(e->terrain));
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
 
     players_reset(e);
     e->ticks = 100;
@@ -1302,7 +1343,7 @@ static void annex_test(void) {
 
 static void attack_test(void) {
     Env *e = test_env(5);
-    memset(e->terrain, 1, sizeof(e->terrain));
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
     e->land_tiles = OF_N;
     players_reset(e);
     bots_init(e);
@@ -1331,7 +1372,8 @@ static unsigned long env_hash(Env *e) {
     unsigned long h = 1469598103934665603UL;
     for (int t = 0; t < OF_N; t++) {
         h = (h ^ e->owner[t]) * 1099511628211UL;
-        h = (h ^ e->terrain[t]) * 1099511628211UL;
+        int ty = is_land(e, t) ? terrain_type(e, t) + 1 : 0;
+        h = (h ^ (unsigned long)ty) * 1099511628211UL;
     }
     for (int p = 1; p < MAXP; p++) {
         unsigned int bits;
@@ -1525,17 +1567,25 @@ static void apply_action(Env *e, int seat_idx) {
 
 // puffer lifecycle
 
-static void add_log(Env *e, int seat_idx) {
+static void add_log(Env *e, int seat_idx, int winner) {
     if (seat_idx != 0) return;
     Seat *s = &e->seats[seat_idx];
     int p = s->seat;
-    e->log.perf           += (float)e->players[p].tiles.count / e->land_tiles;
-    e->log.score          += (float)e->players[p].tiles.count / e->land_tiles;
+    int tiles = e->players[p].tiles.count;
+
+    e->log.perf           += (float)tiles / e->land_tiles;
+    e->log.score          += (float)tiles / e->land_tiles;
     e->log.episode_return += s->episode_return;
     e->log.episode_length += s->decisions;
-    e->log.win            += ((float)e->players[p].tiles.count / e->land_tiles > 0.8f);
+    e->log.win            += ((float)tiles / e->land_tiles > 0.8f);
     e->log.annexations    += e->annex_by[p];
-    e->log.n              += 1.0f;
+
+    if      (tiles == 0)  e->log.eliminated += 1.0f;
+    else if (winner == p) e->log.won        += 1.0f;
+    else if (winner != 0) e->log.rival_won  += 1.0f;
+    else                  e->log.timeout    += 1.0f;
+
+    e->log.n += 1.0f;
 }
 
 void puf_reset(Env *e) {
@@ -1594,7 +1644,7 @@ void puf_step(Env *e) {
         if (died || episode_over) {
             e->agents[a].terminals[0] = 1.0f;
             s->done = 1;
-            add_log(e, a);
+            add_log(e, a, winner);
         }
     }
 
@@ -1618,7 +1668,7 @@ void puf_render(Env *e) {
     ClearBackground((Color){6, 24, 24, 255});
     for (int t = 0; t < OF_N; t++) {
         Color c;
-        if (e->terrain[t] == 0)      c = (Color){20, 40, 70, 255};
+        if (!is_land(e, t))          c = (Color){20, 40, 70, 255};
         else if (e->owner[t] == 0)   c = (Color){60, 70, 60, 255};
         else                         c = PAL[e->owner[t]];
         DrawRectangle(rx(t)*CELL, ry(t)*CELL, CELL, CELL, c);
@@ -1653,6 +1703,10 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "win",            log->win);
     dict_set(out, "annexations",    log->annexations);
+    dict_set(out, "won",            log->won);
+    dict_set(out, "eliminated",     log->eliminated);
+    dict_set(out, "rival_won",      log->rival_won);
+    dict_set(out, "timeout",        log->timeout);
     dict_set(out, "n",              log->n);
 }
 
