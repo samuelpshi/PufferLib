@@ -8,6 +8,9 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include "simplex.h"
+
+#define OF_MAX_OCTAVES 16
 
 typedef float obs_t;
 #include "pufferenv.h"
@@ -110,6 +113,7 @@ struct Env {
     Log log;
     int num_agents;
     unsigned int rng;
+    unsigned int map_rng;
     Agent agents[MAXP-1];
     int tag, boundary_reached;
 
@@ -122,6 +126,9 @@ struct Env {
     unsigned char  terrain[OF_N];
     unsigned short owner[OF_N];
     int  land_tiles;
+    float land_frac;
+    int  largest_comp;
+    int  num_land_comps;
     long ticks;
 
     Player players[MAXP];
@@ -146,6 +153,8 @@ struct Env {
     unsigned int ff_gen;
     int ff_stack[OF_N];
     int ff_take[OF_N];
+
+    float noise[OF_N];
 
     long annex_events;
     long annex_by[MAXP];
@@ -218,6 +227,21 @@ static int rng_int(Env *e, int lo, int hi) {
     return lo + rng_below(e, hi - lo);
 }
 
+static void map_rng_seed(Env *e, unsigned int s) {
+    s ^= 0x9e3779b9u;
+    s ^= s >> 16; s *= 0x7feb352du;
+    s ^= s >> 15; s *= 0x846ca68bu;
+    s ^= s >> 16;
+    e->map_rng = (s == 0) ? 1u : s;
+}
+
+static unsigned int map_rng_next(Env *e) {
+    unsigned int x = e->map_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    e->map_rng = x;
+    return x;
+}
+
 // map
 
 #define OF_LAND_BIT  0x80
@@ -251,50 +275,186 @@ static int is_ocean_shore(Env *e, int t) {
     return 0;
 }
 
+static int cmp_float_asc(const void *a, const void *b) {
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+static void label_land_components(Env *e) {
+    e->cl_gen++;
+    e->num_land_comps = 0;
+    int nc = 0;
+    for (int s = 0; s < OF_N; s++) {
+        if (!is_land(e, s) || e->cl_visited[s] == e->cl_gen) continue;
+        int sp = 0;
+        e->cl_stack[sp++] = s;
+        e->cl_visited[s] = e->cl_gen;
+        e->cl_start[nc]  = s;
+        e->cl_size[nc]   = 0;
+        while (sp > 0) {
+            int t = e->cl_stack[--sp];
+            e->cl_comp[t] = nc;
+            e->cl_size[nc]++;
+            int nb[4], n = neighbors(t, nb);
+            for (int i = 0; i < n; i++) {
+                if (is_land(e, nb[i]) && e->cl_visited[nb[i]] != e->cl_gen) {
+                    e->cl_visited[nb[i]] = e->cl_gen;
+                    e->cl_stack[sp++] = nb[i];
+                }
+            }
+        }
+        nc++;
+    }
+    e->num_land_comps = nc;
+
+    e->largest_comp = 0;
+    for (int c = 1; c < nc; c++)
+        if (e->cl_size[c] > e->cl_size[e->largest_comp]) e->largest_comp = c;
+}
+
 static void fill_terrain(Env *e) {
-    e->land_tiles = 0;
-    for (int r = 0; r < OF_N; r++) {
-        if (ry(r) == 0 || ry(r) == OF_H-1 || rx(r) == 0 || rx(r) == OF_W-1)
-            e->terrain[r] = 0;
-        else
-            e->terrain[r] = OF_LAND_BIT | 5;
+    if (e->map_rng == 0) map_rng_seed(e, 42u);
+    float lf = (e->land_frac > 0.0f && e->land_frac < 1.0f) ? e->land_frac : 0.65f;
+
+    int offset_x = (int)(map_rng_next(e) % 100000u);
+    int offset_y = (int)(map_rng_next(e) % 100000u);
+
+    /* Pass 1 — octave noise, normalise to [0,1], apply edge falloff */
+    {
+        float freq_arr[OF_MAX_OCTAVES];
+        float base_freq = 1.0f / (OF_W / 4.0f);
+        for (int i = 0; i < 8; i++)
+            freq_arr[i] = base_freq * (float)(1 << i);
+
+        for (int r = 0; r < OF_N; r++) e->noise[r] = 0.0f;
+
+        for (int oct = 0; oct < 8; oct++) {
+            float freq = freq_arr[oct];
+            float amp  = 1.0f / (float)(1 << oct);
+            for (int r = 0; r < OF_N; r++) {
+                int x = rx(r), y = ry(r);
+                e->noise[r] += amp * noise2(
+                    freq*(float)x + (float)offset_x,
+                    freq*(float)y + (float)offset_y);
+            }
+        }
+
+        float mn = e->noise[0], mx = e->noise[0];
+        for (int r = 1; r < OF_N; r++) {
+            if (e->noise[r] < mn) mn = e->noise[r];
+            if (e->noise[r] > mx) mx = e->noise[r];
+        }
+        float inv = (mx > mn) ? 1.0f / (mx - mn) : 1.0f;
+        for (int r = 0; r < OF_N; r++)
+            e->noise[r] = (e->noise[r] - mn) * inv;
+
+        float cx = (OF_W - 1) * 0.5f, cy = (OF_H - 1) * 0.5f;
+        float es = (float)(OF_W < OF_H ? OF_W - 1 : OF_H - 1) * 0.5f;
+        for (int t = 0; t < OF_N; t++) {
+            float dx = (float)rx(t) - cx, dy = (float)ry(t) - cy;
+            float r  = sqrtf(dx*dx + dy*dy) / es;
+            float fo = 1.0f - r*r;
+            if (fo < 0.0f) fo = 0.0f;
+            e->noise[t] *= fo;
+        }
     }
 
-    for (int i = 0; i < 15; i++) {
-        int cx  = rng_below(e, OF_W);
-        int cy  = rng_below(e, OF_H);
-        int rad = 4 + rng_below(e, 8);
-        int inner = rad * 2 / 3;
+    /* Pass 2 — threshold for land_frac */
+    float sort_copy[OF_N];
+    memcpy(sort_copy, e->noise, sizeof(sort_copy));
+    qsort(sort_copy, OF_N, sizeof(float), cmp_float_asc);
+    int tidx = (int)((1.0f - lf) * OF_N);
+    if (tidx < 0) tidx = 0;
+    if (tidx >= OF_N) tidx = OF_N - 1;
+    float threshold = sort_copy[tidx];
+    float noise_max = sort_copy[OF_N - 1];
 
-        for (int y = cy-rad; y <= cy+rad; y++) {
-            for (int x = cx-rad; x <= cx+rad; x++) {
-                if (x < 0 || x >= OF_W || y < 0 || y >= OF_H) continue;
-                int r = ref(x, y);
-                if (!is_land(e, r)) continue;
-                int dx = x - cx;
-                int dy = y - cy;
-                int d2 = dx*dx + dy*dy;
-                if (d2 <= rad*rad)
-                    e->terrain[r] = OF_LAND_BIT | ((d2 <= inner*inner) ? 25 : 15);
+    for (int r = 0; r < OF_N; r++)
+        e->terrain[r] = (e->noise[r] >= threshold) ? OF_LAND_BIT : 0u;
+
+    /* Pass 3 — ocean bit via DFS from map-edge water tiles */
+    {
+        e->ff_gen++;
+        int sp = 0;
+        for (int r = 0; r < OF_N; r++) {
+            if (on_map_edge(r) && !is_land(e, r) &&
+                    e->ff_visited[r] != e->ff_gen) {
+                e->ff_visited[r] = e->ff_gen;
+                e->ff_stack[sp++] = r;
+            }
+        }
+        while (sp > 0) {
+            int t = e->ff_stack[--sp];
+            e->terrain[t] |= OF_OCEAN_BIT;
+            int nb[4], n = neighbors(t, nb);
+            for (int i = 0; i < n; i++) {
+                int u = nb[i];
+                if (!is_land(e, u) && e->ff_visited[u] != e->ff_gen) {
+                    e->ff_visited[u] = e->ff_gen;
+                    e->ff_stack[sp++] = u;
+                }
             }
         }
     }
 
-    for (int r = 0; r < OF_N; r++) {
-        if (is_land(e, r)) e->land_tiles++;
-        else               e->terrain[r] |= OF_OCEAN_BIT;
+    /* Pass 4 — magnitudes */
+    {
+        float noise_range = noise_max - threshold;
+        for (int r = 0; r < OF_N; r++) {
+            if (!is_land(e, r)) continue;
+            int mag = 0;
+            if (noise_range > 0.0f) {
+                mag = (int)roundf(30.0f * (e->noise[r] - threshold) / noise_range);
+                if (mag < 0) mag = 0;
+                if (mag > 30) mag = 30;
+            }
+            e->terrain[r] |= (unsigned char)mag;
+        }
+    }
+    {
+        /* FIFO BFS from land tiles for water distance magnitudes */
+        int *bfsq = e->ff_stack;
+        int *wdst = e->ff_take;
+        int head = 0, tail = 0;
+        for (int r = 0; r < OF_N; r++) {
+            if (is_land(e, r)) { wdst[r] = 0; bfsq[tail++] = r; }
+            else                 wdst[r] = -1;
+        }
+        while (head < tail) {
+            int t = bfsq[head++];
+            int nb[4], n = neighbors(t, nb);
+            for (int i = 0; i < n; i++) {
+                if (wdst[nb[i]] < 0) {
+                    wdst[nb[i]] = wdst[t] + 1;
+                    bfsq[tail++] = nb[i];
+                }
+            }
+        }
+        for (int r = 0; r < OF_N; r++) {
+            if (is_land(e, r)) continue;
+            int mag = (wdst[r] + 1) / 2;
+            if (mag > 31) mag = 31;
+            e->terrain[r] = (unsigned char)((e->terrain[r] & ~OF_MAG_MASK) | mag);
+        }
     }
 
+    /* Pass 5 — shoreline bit */
     for (int r = 0; r < OF_N; r++) {
-        int nb[4];
-        int n = neighbors(r, nb);
+        int nb[4], n = neighbors(r, nb);
         int land = is_land(e, r) != 0;
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
             if ((is_land(e, nb[i]) != 0) != land) {
                 e->terrain[r] |= OF_SHORE_BIT;
                 break;
             }
+        }
     }
+
+    e->land_tiles = 0;
+    for (int r = 0; r < OF_N; r++)
+        if (is_land(e, r)) e->land_tiles++;
+
+    label_land_components(e);
 }
 
 static void print_owner(Env *e) {
@@ -998,7 +1158,8 @@ static int spawn_place(Env *e, int p) {
         int cx = rng_below(e, OF_W), cy = rng_below(e, OF_H);
         int c  = ref(cx, cy);
 
-        if (!is_land(e, c) || e->owner[c] != 0) continue;
+        if (!is_land(e, c) || e->owner[c] != 0 ||
+                e->cl_comp[c] != e->largest_comp) continue;
 
         int nb[4];
         int n = neighbors(c, nb), touching = 0;
@@ -1054,6 +1215,7 @@ static void sim_reset(Env *e) {
 static void sim_init(Env *e, unsigned int seed) {
     memset(e, 0, sizeof(*e));
     rng_seed(e, seed);
+    map_rng_seed(e, seed);
     e->cl_gen = 0;
     e->ff_gen = 0;
 }
@@ -1445,6 +1607,152 @@ static void isolation_test(void) {
            ISO_ENVS, ISO_EPS);
 }
 
+static void map_test(void) {
+    int nm = 200;
+    double sum_lf = 0.0;
+    long total_comps = 0, total_lakes = 0, total_sfail = 0;
+    long total_plains = 0, total_high = 0, total_mtn = 0;
+    static int bf_dist[OF_N];
+    static int bf_q[OF_N];
+
+    for (int m = 0; m < nm; m++) {
+        Env *e = (Env*)malloc(sizeof(Env));
+        if (!e) { printf("map_test: oom\n"); exit(1); }
+        sim_init(e, (unsigned int)(m + 1000));
+        e->land_frac = 0.65f;
+        sim_reset(e);
+
+        for (int r = 0; r < OF_N; r++) {
+            if (is_land(e, r) && is_ocean(e, r)) {
+                printf("MAP_TEST FAILED m=%d t=%d: land+ocean terrain=%02x\n",
+                       m, r, e->terrain[r]);
+                exit(1);
+            }
+            if (is_land(e, r) && magnitude(e, r) > 30) {
+                printf("MAP_TEST FAILED m=%d t=%d: land mag %d\n",
+                       m, r, magnitude(e, r));
+                exit(1);
+            }
+        }
+
+        /* water magnitude brute-force BFS */
+        {
+            int head = 0, tail = 0;
+            for (int r = 0; r < OF_N; r++) {
+                if (is_land(e, r)) { bf_dist[r] = 0; bf_q[tail++] = r; }
+                else                 bf_dist[r] = -1;
+            }
+            while (head < tail) {
+                int t = bf_q[head++];
+                int nb[4], n = neighbors(t, nb);
+                for (int i = 0; i < n; i++) {
+                    if (bf_dist[nb[i]] < 0) {
+                        bf_dist[nb[i]] = bf_dist[t] + 1;
+                        bf_q[tail++] = nb[i];
+                    }
+                }
+            }
+            for (int r = 0; r < OF_N; r++) {
+                if (is_land(e, r)) continue;
+                int d = bf_dist[r];
+                int exp = (d < 0) ? 31 : (d + 1) / 2;
+                if (exp > 31) exp = 31;
+                if (magnitude(e, r) != exp) {
+                    printf("MAP_TEST FAILED m=%d t=%d: water mag %d exp %d (d=%d)\n",
+                           m, r, magnitude(e, r), exp, d);
+                    exit(1);
+                }
+            }
+        }
+
+        /* shoreline brute-force */
+        for (int r = 0; r < OF_N; r++) {
+            int nb[4], n = neighbors(r, nb);
+            int land = is_land(e, r) != 0, exp = 0;
+            for (int i = 0; i < n; i++)
+                if ((is_land(e, nb[i]) != 0) != land) { exp = 1; break; }
+            if (((e->terrain[r] & OF_SHORE_BIT) != 0) != exp) {
+                printf("MAP_TEST FAILED m=%d t=%d: shore %d exp %d\n",
+                       m, r, (e->terrain[r]&OF_SHORE_BIT)!=0, exp);
+                exit(1);
+            }
+        }
+
+        /* land_tiles count */
+        {
+            int cnt = 0;
+            for (int r = 0; r < OF_N; r++) if (is_land(e, r)) cnt++;
+            if (cnt != e->land_tiles) {
+                printf("MAP_TEST FAILED m=%d: land_tiles %d vs %d\n",
+                       m, e->land_tiles, cnt);
+                exit(1);
+            }
+        }
+
+        if (e->num_land_comps < 1) {
+            printf("MAP_TEST FAILED m=%d: no land components\n", m);
+            exit(1);
+        }
+
+        float af = (float)e->land_tiles / OF_N;
+        if (fabsf(af - e->land_frac) > 0.01f) {
+            printf("MAP_TEST FAILED m=%d: land frac %.4f vs %.4f\n",
+                   m, (double)af, (double)e->land_frac);
+            exit(1);
+        }
+
+        /* statistics */
+        sum_lf      += af;
+        total_comps += e->num_land_comps;
+        total_sfail += e->spawn_failures;
+
+        for (int r = 0; r < OF_N; r++) {
+            if (!is_land(e, r)) continue;
+            int ty = terrain_type(e, r);
+            if      (ty == 0) total_plains++;
+            else if (ty == 1) total_high++;
+            else              total_mtn++;
+        }
+
+        e->cl_gen++;
+        int lakes = 0;
+        for (int r = 0; r < OF_N; r++) {
+            if (is_land(e,r) || is_ocean(e,r) || e->cl_visited[r]==e->cl_gen) continue;
+            lakes++;
+            int sp = 0;
+            e->ff_stack[sp++] = r;
+            e->cl_visited[r] = e->cl_gen;
+            while (sp > 0) {
+                int t = e->ff_stack[--sp];
+                int nb[4], n = neighbors(t, nb);
+                for (int i = 0; i < n; i++) {
+                    int u = nb[i];
+                    if (!is_land(e,u) && !is_ocean(e,u)
+                            && e->cl_visited[u] != e->cl_gen) {
+                        e->cl_visited[u] = e->cl_gen;
+                        e->ff_stack[sp++] = u;
+                    }
+                }
+            }
+        }
+        total_lakes += lakes;
+
+        free(e);
+    }
+
+    long tlt = total_plains + total_high + total_mtn;
+    printf("map_test: %d maps passed\n", nm);
+    printf("  mean land frac: %.3f\n", sum_lf / nm);
+    if (tlt > 0)
+        printf("  terrain: Plains %.1f%% Highland %.1f%% Mountain %.1f%%\n",
+               100.0 * total_plains / tlt,
+               100.0 * total_high   / tlt,
+               100.0 * total_mtn    / tlt);
+    printf("  mean land comps: %.1f, mean lakes: %.1f\n",
+           (double)total_comps / nm, (double)total_lakes / nm);
+    printf("  spawn failures: %ld over %d maps\n", total_sfail, nm);
+}
+
 static void run_tests(void) {
     ts_test();
     conquer_test();
@@ -1453,6 +1761,7 @@ static void run_tests(void) {
     annex_test();
     attack_test();
     isolation_test();
+    map_test();
 }
 #else
 static void run_tests(void) {}
@@ -1685,6 +1994,12 @@ void puf_init(Env *e, Dict *kwargs) {
     e->action_repeat = (int)dict_get(kwargs, "action_repeat");
     e->max_steps     = (int)dict_get(kwargs, "max_steps");
     e->agent_is_bot  = (int)dict_get(kwargs, "agent_is_bot");
+
+    float lf = dict_get(kwargs, "land_frac");
+    e->land_frac = (lf > 0.0f && lf < 1.0f) ? lf : 0.65f;
+
+    unsigned int ms = (unsigned int)dict_get(kwargs, "map_seed");
+    map_rng_seed(e, ms != 0u ? ms : 123456789u);
 
     rng_seed(e, e->rng);
 
