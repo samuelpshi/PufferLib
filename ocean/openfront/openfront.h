@@ -827,7 +827,8 @@ static int annex_surrounded(Env *e, int p, const int *tiles, int n, int largest)
         if (y < cminy) cminy = y;
         if (y > cmaxy) cmaxy = y;
 
-        if (is_shore(e, t) || on_map_edge(t)) return 0;
+        /* largest path: redundant with unowned-neighbour bail below; kept to mirror PlayerExecution.ts:374 */
+        if ((largest ? is_ocean_shore(e, t) : is_shore(e, t)) || on_map_edge(t)) return 0;
 
         int nb[4];
         int k = neighbors(t, nb);
@@ -1607,6 +1608,129 @@ static void isolation_test(void) {
            ISO_ENVS, ISO_EPS);
 }
 
+static void annex_shore_test(void) {
+    int cx = 24, cy = 24;
+    int center = ref(cx, cy);
+    int east   = ref(cx+1, cy);
+    int west   = ref(cx-1, cy);
+    int north  = ref(cx, cy-1);
+    int south  = ref(cx, cy+1);
+    int pa = 1, pb = 2;
+
+    /* Predicate sanity: lake-shore tile (SHORE_BIT set, east neighbour is lake
+       water with no ocean bit). */
+    {
+        Env *e = test_env(10);
+        memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+        e->terrain[center] = OF_LAND_BIT | 5 | OF_SHORE_BIT;
+        e->terrain[east]   = 1; /* lake water, mag 1 (ceil(dist/2) >= 1) */
+        int r;
+        r = is_shore(e, center);
+        if (r != 1) {
+            printf("SHORE_TEST FAILED predicate lake is_shore: got %d want 1\n", r);
+            exit(1);
+        }
+        r = is_ocean_shore(e, center);
+        if (r != 0) {
+            printf("SHORE_TEST FAILED predicate lake is_ocean_shore: got %d want 0\n", r);
+            exit(1);
+        }
+        /* ocean-shore tile: east neighbour carries ocean bit */
+        e->terrain[east] = OF_OCEAN_BIT | 1;
+        r = is_shore(e, center);
+        if (r != 1) {
+            printf("SHORE_TEST FAILED predicate ocean is_shore: got %d want 1\n", r);
+            exit(1);
+        }
+        r = is_ocean_shore(e, center);
+        if (r != 1) {
+            printf("SHORE_TEST FAILED predicate ocean is_ocean_shore: got %d want 1\n", r);
+            exit(1);
+        }
+        free(e);
+    }
+
+    /* Case 2: largest=1, centre has SHORE_BIT, east is lake (no ocean bit).
+       is_ocean_shore==0 so shore gate passes; east is unowned → o==0 bail fires.
+       Blocked by unowned-neighbour check. */
+    {
+        Env *e = test_env(11);
+        memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+        e->terrain[center] = OF_LAND_BIT | 5 | OF_SHORE_BIT;
+        e->terrain[east]   = 1; /* lake water, mag 1 — unowned */
+        players_reset(e);
+        conquer(e, pa, center);
+        conquer(e, pb, west); conquer(e, pb, north); conquer(e, pb, south);
+        int tiles[1] = {center};
+        int r = annex_surrounded(e, pa, tiles, 1, 1);
+        if (r != 0) {
+            printf("SHORE_TEST FAILED case2 (lake,largest=1): got %d want 0\n", r);
+            exit(1);
+        }
+        free(e);
+    }
+
+    /* Case 3: largest=1, centre has SHORE_BIT, east is ocean (OF_OCEAN_BIT).
+       is_ocean_shore==1 → shore gate fires immediately, returns 0.
+       Blocked by shore gate. */
+    {
+        Env *e = test_env(12);
+        memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+        e->terrain[center] = OF_LAND_BIT | 5 | OF_SHORE_BIT;
+        e->terrain[east]   = OF_OCEAN_BIT;
+        players_reset(e);
+        conquer(e, pa, center);
+        conquer(e, pb, west); conquer(e, pb, north); conquer(e, pb, south);
+        int tiles[1] = {center};
+        int r = annex_surrounded(e, pa, tiles, 1, 1);
+        if (r != 0) {
+            printf("SHORE_TEST FAILED case3 (ocean,largest=1): got %d want 0\n", r);
+            exit(1);
+        }
+        free(e);
+    }
+
+    /* Case 4: largest=0, same terrain as case 2 (lake neighbour).
+       is_shore==1 → shore gate fires, returns 0.
+       Blocked by shore gate (is_shore path). */
+    {
+        Env *e = test_env(13);
+        memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+        e->terrain[center] = OF_LAND_BIT | 5 | OF_SHORE_BIT;
+        e->terrain[east]   = 1; /* lake water, mag 1 */
+        players_reset(e);
+        conquer(e, pa, center);
+        conquer(e, pb, west); conquer(e, pb, north); conquer(e, pb, south);
+        int tiles[1] = {center};
+        int r = annex_surrounded(e, pa, tiles, 1, 0);
+        if (r != 0) {
+            printf("SHORE_TEST FAILED case4 (lake,largest=0): got %d want 0\n", r);
+            exit(1);
+        }
+        free(e);
+    }
+
+    /* Case 5: control — all four neighbours owned by B, no water, no shore bit.
+       Neither shore gate nor o==0 bail fires → returns 1. */
+    {
+        Env *e = test_env(14);
+        memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+        players_reset(e);
+        conquer(e, pa, center);
+        conquer(e, pb, west); conquer(e, pb, east);
+        conquer(e, pb, north); conquer(e, pb, south);
+        int tiles[1] = {center};
+        int r = annex_surrounded(e, pa, tiles, 1, 1);
+        if (r != 1) {
+            printf("SHORE_TEST FAILED case5 (control): got %d want 1\n", r);
+            exit(1);
+        }
+        free(e);
+    }
+
+    printf("annex_shore ok\n");
+}
+
 static void map_test(void) {
     int nm = 200;
     double sum_lf = 0.0;
@@ -1762,6 +1886,7 @@ static void run_tests(void) {
     attack_test();
     isolation_test();
     map_test();
+    annex_shore_test();
 }
 #else
 static void run_tests(void) {}
