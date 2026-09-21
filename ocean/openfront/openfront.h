@@ -643,11 +643,8 @@ static int find_free_slot(Env *e) {
 }
 
 static void atk_push(Env *e, Attack *a, int t) {
-    float mag = 0.0f;
-    if (is_land(e, t)) {
-        int ty = terrain_type(e, t);
-        mag = (ty == 0) ? 1.0f : (ty == 1) ? 1.5f : 2.0f;
-    }
+    int ty = terrain_type(e, t);
+    float mag = (ty == 0) ? 1.0f : (ty == 1) ? 1.5f : 2.0f;
 
     int nb[4];
     int n = neighbors(t, nb);
@@ -763,7 +760,6 @@ static void attack_tick(Env *e, Attack *a) {
         }
 
         if (e->owner[t] != a->target) continue;
-        if (!is_land(e, t)) continue;
         int nb[4];
         int n = neighbors(t, nb);
         int on_border = 0;
@@ -1677,7 +1673,7 @@ static void annex_shore_test(void) {
         Env *e = test_env(12);
         memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
         e->terrain[center] = OF_LAND_BIT | 5 | OF_SHORE_BIT;
-        e->terrain[east]   = OF_OCEAN_BIT;
+        e->terrain[east]   = OF_OCEAN_BIT | 1;
         players_reset(e);
         conquer(e, pa, center);
         conquer(e, pb, west); conquer(e, pb, north); conquer(e, pb, south);
