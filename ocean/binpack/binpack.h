@@ -1,8 +1,3 @@
-/* Online 3D bin packing. Spec: binpack_env_spec.md (section refs below).
-   Problem setting follows Zhao et al., "Online 3D Bin Packing with
-   Constrained Deep Reinforcement Learning", AAAI 2021: height-map state,
-   exact feasibility mask, cutting-stock instances, three-tier support rule. */
-
 #pragma once
 #include <stdint.h>
 #include <stdio.h>
@@ -120,6 +115,10 @@ struct Env {
     long cause_sum[5];
     int illegal;
     float ep_return;
+
+    BpPlaced last_placed[BP_MAX_BOXES];
+    int last_n, last_boxes, render_hold;
+    float last_util;
 };
 
 static inline int bp_cell(int x, int y) { return y * BP_SIZE + x; }
@@ -221,6 +220,7 @@ static void bp_generate(Env *e, unsigned int seed) {
     }
 
 #ifdef DEBUG
+
     uint8_t claim[BP_VOLUME];
     memset(claim, 0, sizeof(claim));
     int vol = 0;
@@ -335,6 +335,7 @@ static void bp_place(Env *e, int a) {
 }
 
 #ifdef DEBUG
+
 static void bp_check_state(const Env *e) {
     BP_CHECK(e->n_placed <= e->n_boxes && e->n_boxes <= BP_MAX_BOXES, "I-S5 counts");
     int occ = 0;
@@ -385,21 +386,34 @@ static int bp_policy_dbl(Env *e) {
     return best;
 }
 
+static inline int bp_h_after(const Env *e, int i, int j, int x, int y, int dx, int dy, int top) {
+    if (i >= x && i < x + dx && j >= y && j < y + dy) return top;
+    return e->height[bp_cell(i, j)];
+}
+
+static int bp_bumpiness_after(const Env *e, int x, int y, int dx, int dy, int top) {
+    int b = 0;
+    for (int j = 0; j < BP_SIZE; j++)
+        for (int i = 0; i < BP_SIZE; i++) {
+            int h = bp_h_after(e, i, j, x, y, dx, dy, top);
+            if (i + 1 < BP_SIZE) b += abs(h - bp_h_after(e, i + 1, j, x, y, dx, dy, top));
+            if (j + 1 < BP_SIZE) b += abs(h - bp_h_after(e, i, j + 1, x, y, dx, dy, top));
+        }
+    return b;
+}
+
 static int bp_policy_flat(Env *e) {
     const unsigned char *m = e->agents[0].action_mask;
     const BpBox *b = &e->instance[e->cursor];
-    int hmax = 0;
-    for (int c = 0; c < BP_CELLS; c++) if (e->height[c] > hmax) hmax = e->height[c];
-    int best = -1, bh = 0; long bk = 0;
+    int best = -1, bb = 0; long bk = 0;
     for (int a = 0; a < BP_ACT_TOTAL; a++) {
         if (!m[a]) continue;
         int o, x, y, dx, dy, dz;
         bp_decode(a, &o, &x, &y);
         bp_orient(b, o, &dx, &dy, &dz);
-        int top = e->rest_z[a] + dz;
-        int h = top > hmax ? top : hmax;
+        int bump = bp_bumpiness_after(e, x, y, dx, dy, e->rest_z[a] + dz);
         long k = bp_dbl_key(e, a);
-        if (best < 0 || h < bh || (h == bh && k < bk)) { best = a; bh = h; bk = k; }
+        if (best < 0 || bump < bb || (bump == bb && k < bk)) { best = a; bb = bump; bk = k; }
     }
     return best;
 }
@@ -453,6 +467,11 @@ static void bp_reset_seeded(Env *e, unsigned int seed) {
 static void bp_add_log(Env *e) {
     int len = e->n_placed;
     float util = (float)e->vol_placed / (float)BP_VOLUME;
+    memcpy(e->last_placed, e->placed, sizeof(BpPlaced) * (size_t)e->n_placed);
+    e->last_n = e->n_placed;
+    e->last_boxes = e->n_boxes;
+    e->last_util = util;
+    e->render_hold = 1;
     BP_CHECK(len >= 1, "zero-length episode");
     BP_CHECK(e->ep_return - util < 1e-4f && util - e->ep_return < 1e-4f,
              "I-L1 return %f vs util %f", (double)e->ep_return, (double)util);
@@ -561,25 +580,67 @@ static inline void bp_print_mask(const Env *e) {
     }
 }
 
-void puf_render(Env *e) {
-    const int CELL = 48;
-    if (!IsWindowReady()) {
-        InitWindow(BP_SIZE * CELL, BP_SIZE * CELL + 40, "BinPack");
-        SetTargetFPS(10);
+static void bp_draw_scene(const BpPlaced *pl, int n, const char *hud, const char *hud2) {
+    static Camera3D cam;
+    static int cam_init = 0;
+    if (!cam_init) {
+        cam.position = (Vector3){16.0f, 14.0f, 16.0f};
+        cam.target = (Vector3){0.0f, 3.5f, 0.0f};
+        cam.up = (Vector3){0.0f, 1.0f, 0.0f};
+        cam.fovy = 45.0f;
+        cam.projection = CAMERA_PERSPECTIVE;
+        cam_init = 1;
     }
-    if (IsKeyDown(KEY_ESCAPE)) exit(0);
+    UpdateCamera(&cam, CAMERA_ORBITAL);
+    const float h = (float)BP_SIZE / 2.0f;
+
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
-    for (int y = 0; y < BP_SIZE; y++)
-        for (int x = 0; x < BP_SIZE; x++) {
-            int h = e->height[bp_cell(x, y)];
-            unsigned char g = (unsigned char)(40 + (215 * h) / BP_SIZE);
-            DrawRectangle(x * CELL, (BP_SIZE - 1 - y) * CELL, CELL - 1, CELL - 1, (Color){g, g, g, 255});
-        }
-    DrawText(TextFormat("util %.3f  box %d/%d", (double)e->vol_placed / BP_VOLUME, e->cursor, e->n_boxes),
-             8, BP_SIZE * CELL + 10, 20, (Color){241, 241, 241, 255});
+    BeginMode3D(cam);
+    DrawGrid(BP_SIZE, 1.0f);
+    DrawCubeWires((Vector3){0.0f, h, 0.0f}, (float)BP_SIZE, (float)BP_SIZE, (float)BP_SIZE,
+                  (Color){120, 140, 140, 255});
+    for (int i = 0; i < n; i++) {
+        const BpPlaced *p = &pl[i];
+        Vector3 c = {(float)p->x + (float)p->dx / 2.0f - h,
+                     (float)p->z + (float)p->dz / 2.0f,
+                     (float)p->y + (float)p->dy / 2.0f - h};
+        Color col = ColorFromHSV((float)((i * 47) % 360), 0.45f, 0.95f);
+        if (i == n - 1) col = ColorFromHSV((float)((i * 47) % 360), 0.75f, 1.0f);
+        float s = 0.98f;
+        DrawCube(c, (float)p->dx * s, (float)p->dz * s, (float)p->dy * s, col);
+        DrawCubeWires(c, (float)p->dx * s, (float)p->dz * s, (float)p->dy * s, (Color){20, 30, 30, 255});
+    }
+    EndMode3D();
+    DrawText(hud, 12, 12, 20, (Color){241, 241, 241, 255});
+    if (hud2) DrawText(hud2, 12, 38, 20, (Color){255, 200, 90, 255});
     EndDrawing();
     puf_web_vsync();
+}
+
+void puf_render(Env *e) {
+    if (!IsWindowReady()) {
+        InitWindow(900, 760, "BinPack");
+        SetTargetFPS(8);
+    }
+    if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) exit(0);
+
+    if (e->render_hold) {
+        e->render_hold = 0;
+        const char *hud = TextFormat("episode done  util %.3f  placed %d/%d",
+                                     (double)e->last_util, e->last_n, e->last_boxes);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s", hud);
+        for (int f = 0; f < 20 && !WindowShouldClose(); f++)
+            bp_draw_scene(e->last_placed, e->last_n, buf, "full or no legal placement");
+        if (WindowShouldClose()) exit(0);
+        return;
+    }
+    const BpBox *b = &e->instance[e->cursor];
+    char buf[128];
+    snprintf(buf, sizeof(buf), "util %.3f  box %d/%d  next %dx%dx%d",
+             (double)e->vol_placed / BP_VOLUME, e->cursor, e->n_boxes, b->d[0], b->d[1], b->d[2]);
+    bp_draw_scene(e->placed, e->n_placed, buf, NULL);
 }
 
 void puf_init(Env *e, Dict *kwargs) {
