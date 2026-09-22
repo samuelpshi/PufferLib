@@ -1384,6 +1384,13 @@ static void check_borders(Env *e) {
 
 #ifdef DEBUG
 
+static uint32_t test_rng_state = 2463534242u;
+static inline uint32_t test_rand(void) {
+    uint32_t x = test_rng_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return test_rng_state = x;
+}
+
 static Env *test_env(unsigned int seed) {
     Env *e = (Env*)malloc(sizeof(Env));
     if (!e) { printf("test_env: out of memory\n"); exit(1); }
@@ -1395,13 +1402,14 @@ static TileSet test_set;
 static int test_present[OF_N];
 
 static void ts_test(void) {
+    test_rng_state = 2463534242u;
     ts_init(&test_set);
     memset(test_present, 0, sizeof(test_present));
     int n_present = 0;
 
     for (int step = 0; step < 200000; step++) {
-        int t = rand() % OF_N;
-        if (rand() % 2) {
+        int t = (int)(test_rand() % OF_N);
+        if (test_rand() % 2) {
             ts_add(&test_set, t);
             if (!test_present[t]) { test_present[t] = 1; n_present++; }
         } else {
@@ -1423,12 +1431,13 @@ static void ts_test(void) {
 }
 
 static void conquer_test(void) {
+    test_rng_state = 2463534242u;
     Env *e = test_env(1);
     memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
     players_reset(e);
     for (int step = 0; step < 50000; step++) {
-        int p = 1 + rand() % (MAXP - 1);
-        int t = rand() % OF_N;
+        int p = 1 + (int)(test_rand() % (MAXP - 1));
+        int t = (int)(test_rand() % OF_N);
         conquer(e, p, t);
         if (step % 500 == 0) check_borders(e);
     }
@@ -1475,6 +1484,7 @@ static void blob_test(void) {
 }
 
 static void heap_test(void) {
+    test_rng_state = 2463534242u;
     Env *e = test_env(3);
     Heap *h = (Heap*)malloc(sizeof(Heap));
     if (!h) { printf("heap_test: out of memory\n"); exit(1); }
@@ -1482,7 +1492,7 @@ static void heap_test(void) {
 
     int n_push = HEAPCAP;
     for (int i = 0; i < n_push; i++)
-        heap_push(e, h, i % OF_N, (float)(rand() % 100000));
+        heap_push(e, h, i % OF_N, (float)(test_rand() % 100000));
 
     float prev = -1.0f;
     int popped = 0;
@@ -1498,8 +1508,8 @@ static void heap_test(void) {
 
     heap_init(h);
     for (int step = 0; step < 100000; step++) {
-        if (h->count == 0 || rand() % 2)
-            heap_push(e, h, rand() % OF_N, (float)(rand() % 1000));
+        if (h->count == 0 || test_rand() % 2)
+            heap_push(e, h, (int)(test_rand() % OF_N), (float)(test_rand() % 1000));
         else
             heap_pop(h);
         for (int i = 0; i < h->count; i++) {
