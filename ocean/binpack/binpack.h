@@ -26,7 +26,6 @@ typedef float obs_t;
 #define BP_CHECK(cond, ...) ((void)0)
 #endif
 
-/* §2 constants */
 #define BP_SIZE       10
 #define BP_MIN_DIM    2
 #define BP_MAX_DIM    (BP_SIZE / 2)
@@ -36,10 +35,9 @@ typedef float obs_t;
 #define BP_NORIENT    6
 #define BP_ACT_TOTAL  (BP_NORIENT * BP_CELLS)
 #ifndef BP_PREVIEW_K
-#define BP_PREVIEW_K  0   /* compile-time: it sizes OBS_SIZE (see note in handoff) */
+#define BP_PREVIEW_K  0
 #endif
 
-/* Z21 three-tier support rule, integer percent, strict > (§4.2 L3) */
 #define BP_SUPPORT_1  60
 #define BP_SUPPORT_2  80
 #define BP_SUPPORT_3  95
@@ -58,16 +56,13 @@ BP_STATIC_ASSERT(BP_SIZE < 256, "rest_z is uint8");
 enum { BP_POLICY_NONE = 0, BP_POLICY_RANDOM = 1, BP_POLICY_DBL = 2, BP_POLICY_FLAT = 3 };
 enum { BP_LEGAL = 0, BP_FAIL_ORIENT, BP_FAIL_FOOTPRINT, BP_FAIL_HEIGHT, BP_FAIL_SUPPORT };
 
-/* Generator output: as-cut dims and target min corner. The target
-   orientation is always 0 because as-cut dims ARE the tiling orientation. */
 typedef struct {
     uint8_t d[3];
     uint8_t tx, ty, tz;
 } BpBox;
 
-/* Where the agent put a box (§3.2: separate from instance[]). */
 typedef struct {
-    uint8_t inst;           /* index into instance[] */
+    uint8_t inst;
     uint8_t o;
     uint8_t dx, dy, dz;
     uint8_t x, y, z;
@@ -80,6 +75,7 @@ typedef struct {
 
 struct Log {
     float perf;
+    float score;
     float utilization;
     float boxes_placed;
     float boxes_remaining;
@@ -98,34 +94,33 @@ struct Env {
     int tag;
     int boundary_reached;
     int num_agents;
-    unsigned int rng;        /* master stream: draws one instance seed per episode */
+    unsigned int rng;
 
-    unsigned int gen_rng;    /* instance generator (cuts, then G6 tie draws) */
-    unsigned int pol_rng;    /* in-env random baseline only */
+    unsigned int gen_rng;
+    unsigned int pol_rng;
 
-    int num_orient;          /* config, in {2, 6} */
-    int stability;           /* config, L3 on/off */
-    int policy;              /* config, BP_POLICY_* */
+    int num_orient;
+    int stability;
+    int policy;
+    int eval_seeds;
+    int ep_count;
 
-    uint8_t height[BP_CELLS];                 /* indexed by bp_cell(x, y) */
-    uint8_t voxel[BP_SIZE * BP_CELLS];        /* owner = placed index + 1, 0 = empty */
-    uint8_t rest_z[BP_ACT_TOTAL];             /* resting z per action, valid where mask = 1 */
+    uint8_t height[BP_CELLS];
+    uint8_t voxel[BP_SIZE * BP_CELLS];
+    uint8_t rest_z[BP_ACT_TOTAL];
 
-    BpBox instance[BP_MAX_BOXES];             /* arrival order (after G6 sort) */
+    BpBox instance[BP_MAX_BOXES];
     BpPlaced placed[BP_MAX_BOXES];
     BpBlock cut_stack[BP_MAX_BOXES];
 
     int n_boxes, n_placed, cursor;
     int vol_placed;
 
-    /* per-episode accumulators, flushed at add_log */
     long legal_sum;
     long cause_sum[5];
     int illegal;
     float ep_return;
 };
-
-/* ---------- indexing: the only encode/decode sites (§3.1 D5) ---------- */
 
 static inline int bp_cell(int x, int y) { return y * BP_SIZE + x; }
 
@@ -140,7 +135,6 @@ static inline void bp_decode(int a, int *o, int *x, int *y) {
 
 static inline int bp_vox(int x, int y, int z) { return z * BP_CELLS + bp_cell(x, y); }
 
-/* D4: orientation o -> which as-cut dim lands on (x, y, z). 0-1 keep c up. */
 static const uint8_t BP_PERM[BP_NORIENT][3] = {
     {0, 1, 2}, {1, 0, 2}, {0, 2, 1}, {2, 0, 1}, {1, 2, 0}, {2, 1, 0},
 };
@@ -151,14 +145,12 @@ static inline void bp_orient(const BpBox *b, int o, int *dx, int *dy, int *dz) {
     *dz = b->d[BP_PERM[o][2]];
 }
 
-/* ---------- rng (§7) ---------- */
-
 static inline unsigned int bp_splitmix32(unsigned int s) {
     s += 0x9e3779b9u;
     s ^= s >> 16; s *= 0x7feb352du;
     s ^= s >> 15; s *= 0x846ca68bu;
     s ^= s >> 16;
-    return s == 0 ? 1u : s;   /* 0 is xorshift32's fixed point */
+    return s == 0 ? 1u : s;
 }
 
 static inline unsigned int bp_xorshift(unsigned int *st) {
@@ -173,8 +165,6 @@ static inline unsigned int bp_xorshift(unsigned int *st) {
 static inline int bp_below(unsigned int *st, int n) {
     return (int)(bp_xorshift(st) % (unsigned int)n);
 }
-
-/* ---------- generator: cut-and-shuffle / CSD (§4.7) ---------- */
 
 static void bp_generate(Env *e, unsigned int seed) {
     e->gen_rng = bp_splitmix32(seed);
@@ -191,7 +181,7 @@ static void bp_generate(Env *e, unsigned int seed) {
         int viol[3], nv = 0;
         for (int k = 0; k < 3; k++) if (b.l[k] > BP_MAX_DIM) viol[nv++] = k;
 
-        if (nv == 0) {                                    /* G3: final */
+        if (nv == 0) {
             BP_CHECK(e->n_boxes < BP_MAX_BOXES, "box count overflow");
             BpBox *bx = &e->instance[e->n_boxes++];
             bx->d[0] = b.l[0]; bx->d[1] = b.l[1]; bx->d[2] = b.l[2];
@@ -199,9 +189,9 @@ static void bp_generate(Env *e, unsigned int seed) {
             continue;
         }
 
-        int ax = viol[bp_below(&e->gen_rng, nv)];                          /* G4 */
+        int ax = viol[bp_below(&e->gen_rng, nv)];
         int L = b.l[ax];
-        int p = BP_MIN_DIM + bp_below(&e->gen_rng, L - 2 * BP_MIN_DIM + 1);  /* G5: p in [MIN, L-MIN] */
+        int p = BP_MIN_DIM + bp_below(&e->gen_rng, L - 2 * BP_MIN_DIM + 1);
 
         BpBlock lo = b, hi = b;
         lo.l[ax] = (uint8_t)p;
@@ -213,12 +203,10 @@ static void bp_generate(Env *e, unsigned int seed) {
         e->cut_stack[top++] = hi;
     }
 
-    /* G6, CUT-1: sort by target z, ties by one draw per box, drawn in
-       emission order AFTER all cuts (R5: this order is part of the eval set). */
     unsigned int key[BP_MAX_BOXES];
     for (int i = 0; i < e->n_boxes; i++) key[i] = bp_xorshift(&e->gen_rng);
 
-    for (int i = 1; i < e->n_boxes; i++) {               /* insertion sort, stable */
+    for (int i = 1; i < e->n_boxes; i++) {
         BpBox b = e->instance[i];
         unsigned int k = key[i];
         int j = i - 1;
@@ -233,7 +221,6 @@ static void bp_generate(Env *e, unsigned int seed) {
     }
 
 #ifdef DEBUG
-    /* I-G1, I-G2, I-G3 */
     uint8_t claim[BP_VOLUME];
     memset(claim, 0, sizeof(claim));
     int vol = 0;
@@ -256,9 +243,6 @@ static void bp_generate(Env *e, unsigned int seed) {
 #endif
 }
 
-/* ---------- legality (§4.2) ---------- */
-
-/* Resting z = max height over the footprint. Caller guarantees L1. */
 static inline int bp_rest_z(const Env *e, int x, int y, int dx, int dy) {
     int z = 0;
     for (int j = y; j < y + dy; j++)
@@ -272,7 +256,7 @@ static inline int bp_stable(const Env *e, int x, int y, int dx, int dy, int z) {
     for (int j = y; j < y + dy; j++)
         for (int i = x; i < x + dx; i++)
             sup += (e->height[bp_cell(i, j)] == z);
-    int x1 = x + dx - 1, y1 = y + dy - 1;             /* L4 */
+    int x1 = x + dx - 1, y1 = y + dy - 1;
     int corners = (e->height[bp_cell(x, y)] == z) + (e->height[bp_cell(x1, y)] == z)
                 + (e->height[bp_cell(x, y1)] == z) + (e->height[bp_cell(x1, y1)] == z);
     if (sup * 100 > BP_SUPPORT_1 * area && corners == 4) return 1;
@@ -281,7 +265,6 @@ static inline int bp_stable(const Env *e, int x, int y, int dx, int dy, int z) {
     return 0;
 }
 
-/* First failure in the fixed order L6, L1, L2, L3. Writes resting z on success. */
 static int bp_check(const Env *e, const BpBox *b, int o, int x, int y, int *z_out) {
     if (o >= e->num_orient) return BP_FAIL_ORIENT;
     int dx, dy, dz;
@@ -300,8 +283,6 @@ static inline int bp_is_legal(const Env *e, int a) {
     return bp_check(e, &e->instance[e->cursor], o, x, y, NULL) == BP_LEGAL;
 }
 
-/* Writes all 600 mask bytes and rest_z. Returns popcount; causes[] gets
-   first-failure counts (index BP_LEGAL = popcount). */
 static int bp_build_mask(Env *e, long causes[5]) {
     unsigned char *mask = e->agents[0].action_mask;
     const BpBox *b = &e->instance[e->cursor];
@@ -318,8 +299,6 @@ static int bp_build_mask(Env *e, long causes[5]) {
     return pop;
 }
 
-/* ---------- placement ---------- */
-
 static void bp_place(Env *e, int a) {
     int o, x, y, dx, dy, dz;
     bp_decode(a, &o, &x, &y);
@@ -330,7 +309,7 @@ static void bp_place(Env *e, int a) {
 #ifdef DEBUG
     BP_CHECK(bp_check(e, b, o, x, y, NULL) == BP_LEGAL, "illegal action %d reached bp_place (o%d x%d y%d)", a, o, x, y);
     BP_CHECK(z == e->rest_z[a], "I-S7 rest z %d vs mask %d", z, e->rest_z[a]);
-    for (int j = y; j < y + dy; j++)                        /* I-M5 / L5 */
+    for (int j = y; j < y + dy; j++)
         for (int i = x; i < x + dx; i++)
             BP_CHECK(e->height[bp_cell(i, j)] <= z, "I-M5 drop path blocked");
 #endif
@@ -356,7 +335,6 @@ static void bp_place(Env *e, int a) {
 }
 
 #ifdef DEBUG
-/* I-S1, I-S2, I-S4, I-S5, I-S6 */
 static void bp_check_state(const Env *e) {
     BP_CHECK(e->n_placed <= e->n_boxes && e->n_boxes <= BP_MAX_BOXES, "I-S5 counts");
     int occ = 0;
@@ -375,14 +353,11 @@ static void bp_check_state(const Env *e) {
         }
 }
 
-/* I-M3: mask bit == is_legal, all 600. I-M1 checked by caller. */
 static void bp_check_mask(const Env *e) {
     for (int a = 0; a < BP_ACT_TOTAL; a++)
         BP_CHECK(e->agents[0].action_mask[a] == (unsigned char)bp_is_legal(e, a), "I-M3 mask[%d]", a);
 }
 #endif
-
-/* ---------- baselines (§6), run through the same mask ---------- */
 
 static int bp_policy_random(Env *e) {
     const unsigned char *m = e->agents[0].action_mask;
@@ -393,7 +368,6 @@ static int bp_policy_random(Env *e) {
     return -1;
 }
 
-/* B2 key: (z, y, x, o), lexicographic; smaller wins. */
 static inline long bp_dbl_key(const Env *e, int a) {
     int o, x, y;
     bp_decode(a, &o, &x, &y);
@@ -411,8 +385,6 @@ static int bp_policy_dbl(Env *e) {
     return best;
 }
 
-/* B3: minimize max column height after placement. Placement only raises
-   the footprint, to exactly z+dz, so new max = max(current max, z+dz). */
 static int bp_policy_flat(Env *e) {
     const unsigned char *m = e->agents[0].action_mask;
     const BpBox *b = &e->instance[e->cursor];
@@ -432,8 +404,6 @@ static int bp_policy_flat(Env *e) {
     return best;
 }
 
-/* ---------- observation (§5.1) ---------- */
-
 static void bp_compute_obs(Env *e) {
     obs_t *ob = e->agents[0].observations;
     const float inv = 1.0f / (float)BP_SIZE;
@@ -451,15 +421,11 @@ static void bp_compute_obs(Env *e) {
     }
 }
 
-/* ---------- episode lifecycle ---------- */
-
 static void bp_accumulate(Env *e, const long causes[5]) {
     e->legal_sum += causes[BP_LEGAL];
     for (int k = 0; k < 5; k++) e->cause_sum[k] += causes[k];
 }
 
-/* Fresh episode on a given instance seed. Writes obs + mask; never
-   touches rewards/terminals (the terminal step's values must survive). */
 static void bp_reset_seeded(Env *e, unsigned int seed) {
     memset(e->height, 0, sizeof(e->height));
     memset(e->voxel, 0, sizeof(e->voxel));
@@ -485,13 +451,14 @@ static void bp_reset_seeded(Env *e, unsigned int seed) {
 }
 
 static void bp_add_log(Env *e) {
-    int len = e->n_placed;                     /* = masks presented = decisions */
+    int len = e->n_placed;
     float util = (float)e->vol_placed / (float)BP_VOLUME;
     BP_CHECK(len >= 1, "zero-length episode");
     BP_CHECK(e->ep_return - util < 1e-4f && util - e->ep_return < 1e-4f,
              "I-L1 return %f vs util %f", (double)e->ep_return, (double)util);
     float denom = (float)len * (float)BP_ACT_TOTAL;
     e->log.perf                 += util;
+    e->log.score                += util;
     e->log.utilization          += util;
     e->log.boxes_placed         += (float)e->n_placed;
     e->log.boxes_remaining      += (float)(e->n_boxes - e->n_placed);
@@ -505,7 +472,10 @@ static void bp_add_log(Env *e) {
 }
 
 void puf_reset(Env *e) {
-    bp_reset_seeded(e, bp_xorshift(&e->rng));
+    unsigned int seed = e->eval_seeds > 0 ? (unsigned int)(e->eval_seeds + e->ep_count)
+                                          : bp_xorshift(&e->rng);
+    e->ep_count++;
+    bp_reset_seeded(e, seed);
 }
 
 void puf_step(Env *e) {
@@ -520,14 +490,11 @@ void puf_step(Env *e) {
         default:               a = (int)e->agents[0].actions[0]; break;
     }
 
-    /* I-M2 as a counter, not a trust assumption: puffercpu.c's untrained eval
-       sends action 0 with no forward pass, and render's human override is
-       unmasked. Unguarded, an illegal action writes voxels past z = SIZE. */
     const unsigned char *mask = e->agents[0].action_mask;
     if (a < 0 || a >= BP_ACT_TOTAL || !mask[a]) {
         e->illegal++;
         a = 0;
-        while (!mask[a]) a++;        /* I-M1: a legal action exists */
+        while (!mask[a]) a++;
     }
 
     int vol_before = e->vol_placed;
@@ -540,7 +507,7 @@ void puf_step(Env *e) {
     bp_check_state(e);
 #endif
 
-    if (e->cursor == e->n_boxes) {                       /* §4.4 (a) */
+    if (e->cursor == e->n_boxes) {
         BP_CHECK(e->vol_placed == BP_VOLUME, "exhausted below full volume");
         e->agents[0].terminals[0] = 1.0f;
         bp_add_log(e);
@@ -550,7 +517,7 @@ void puf_step(Env *e) {
 
     long causes[5];
     int pop = bp_build_mask(e, causes);
-    if (pop == 0) {                                      /* §4.4 (b), immediate reset */
+    if (pop == 0) {
         e->agents[0].terminals[0] = 1.0f;
         bp_add_log(e);
         puf_reset(e);
@@ -562,8 +529,6 @@ void puf_step(Env *e) {
     bp_check_mask(e);
 #endif
 }
-
-/* ---------- dev printers (§8.3) ---------- */
 
 static inline void bp_print_layers(const Env *e) {
     for (int z = 0; z < BP_SIZE; z++) {
@@ -596,8 +561,6 @@ static inline void bp_print_mask(const Env *e) {
     }
 }
 
-/* ---------- puffer interface ---------- */
-
 void puf_render(Env *e) {
     const int CELL = 48;
     if (!IsWindowReady()) {
@@ -626,8 +589,11 @@ void puf_init(Env *e, Dict *kwargs) {
     e->stability = (int)dict_get(kwargs, "stability") != 0;
     e->policy = (int)dict_get(kwargs, "policy");
     if (e->policy < BP_POLICY_NONE || e->policy > BP_POLICY_FLAT) e->policy = BP_POLICY_NONE;
+    e->eval_seeds = (int)dict_get(kwargs, "eval_seeds");
+    if (e->eval_seeds < 0) e->eval_seeds = 0;
+    e->ep_count = 0;
 
-    unsigned int base = e->rng;              /* framework: env index */
+    unsigned int base = e->rng;
     e->rng = bp_splitmix32(base);
     e->pol_rng = bp_splitmix32(base ^ 0x5bd1e995u);
     e->agents[0].policy = 0;
@@ -636,6 +602,7 @@ void puf_init(Env *e, Dict *kwargs) {
 
 void puf_log(Log *log, Dict *out) {
     dict_set(out, "perf",                 log->perf);
+    dict_set(out, "score",                log->score);
     dict_set(out, "utilization",          log->utilization);
     dict_set(out, "boxes_placed",         log->boxes_placed);
     dict_set(out, "boxes_remaining",      log->boxes_remaining);
