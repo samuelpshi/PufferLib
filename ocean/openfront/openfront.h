@@ -887,6 +887,7 @@ static void attack_tick(Env *e, Attack *a) {
 
         budget   -= cost;
         a->troops -= atk_loss;
+        if (a->troops < 0.0f) a->troops = 0.0f;
         conquer(e, a->attacker, t);
 
         if (a->target != 0 && e->players[a->target].tiles.count < WIPE_TILES)
@@ -1374,6 +1375,17 @@ static void check_borders(Env *e) {
         }
         if (e->players[p].troops != e->players[p].troops) {
             printf("TROOPS NaN: p%d\n", p);
+            exit(1);
+        }
+    }
+    for (int i = 0; i < MAXATK; i++) {
+        if (!e->attacks[i].active) continue;
+        if (e->attacks[i].troops < 0.0f) {
+            printf("ATTACK TROOPS BROKEN: slot %d troops=%f\n", i, (double)e->attacks[i].troops);
+            exit(1);
+        }
+        if (e->attacks[i].troops != e->attacks[i].troops) {
+            printf("ATTACK TROOPS NaN: slot %d\n", i);
             exit(1);
         }
     }
