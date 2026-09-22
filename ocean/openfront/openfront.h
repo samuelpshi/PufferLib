@@ -132,8 +132,8 @@ OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 #define SPAWN_TRIES    1000
 #define SPAWN_RELAX    750
 
-#define START_TROOPS_HUMAN 25000.0f
-#define START_TROOPS_BOT   10000.0f
+#define START_TROOPS_HUMAN 25000.0
+#define START_TROOPS_BOT   10000.0
 
 // types
 
@@ -152,7 +152,7 @@ typedef struct {
 typedef struct {
     TileSet tiles;
     TileSet border;
-    float troops;
+    double troops;
     int alive;
 } Player;
 
@@ -160,16 +160,16 @@ typedef struct {
     int   active;
     int   attacker;
     int   target;
-    float troops;
+    double troops;
     Heap  heap;
 } Attack;
 
 typedef struct {
     int attack_rate;
     int attack_off;
-    float trigger_ratio;
-    float reserve_ratio;
-    float expand_ratio;
+    double trigger_ratio;
+    double reserve_ratio;
+    double expand_ratio;
     int neighbors_tn;
 } Bot;
 
@@ -259,6 +259,12 @@ static int rx(int r) { return r % OF_W; }
 static int ry(int r) { return r / OF_W; }
 
 static float within(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static double within_d(double v, double lo, double hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
@@ -699,24 +705,23 @@ static void players_reset(Env *e) {
 
 // economy
 
-static float max_troops(Env *e, int p) {
-    float tiles = (float)e->players[p].tiles.count;
-    float m = 2.0f * ((float)det_pow((double)tiles, 0.6) * 1000.0f + 50000.0f);
-    if (e->is_bot[p]) m /= 3.0f;
+static double max_troops(Env *e, int p) {
+    double m = 2.0 * (det_pow((double)e->players[p].tiles.count, 0.6) * 1000.0 + 50000.0);
+    if (e->is_bot[p]) m /= 3.0;
     return m;
 }
 
-static float start_troops(Env *e, int p) {
+static double start_troops(Env *e, int p) {
     return e->is_bot[p] ? START_TROOPS_BOT : START_TROOPS_HUMAN;
 }
 
 static void player_tick(Env *e, int p) {
     if (!e->players[p].alive) return;
-    float max = max_troops(e, p);
-    float troops = e->players[p].troops;
-    float add = 10.0f + (float)det_pow((double)troops, 0.73) / 4.0f;
-    add *= (1.0f - troops / max);
-    if (e->is_bot[p]) add *= 0.5f;
+    double max = max_troops(e, p);
+    double troops = e->players[p].troops;
+    double add = 10.0 + det_pow(troops, 0.73) / 4.0;
+    add *= (1.0 - troops / max);
+    if (e->is_bot[p]) add *= 0.5;
     troops += add;
     if (troops > max) troops = max;
     e->players[p].troops = troops;
@@ -744,11 +749,11 @@ static void atk_push(Env *e, Attack *a, int t) {
     heap_push(e, &a->heap, t, pri);
 }
 
-static void attack_start(Env *e, int attacker, int target, float troops) {
+static void attack_start(Env *e, int attacker, int target, double troops) {
     if (attacker == target) return;
 
     if (troops > e->players[attacker].troops) troops = e->players[attacker].troops;
-    if (troops < 1.0f) return;
+    if (troops < 1.0) return;
     e->players[attacker].troops -= troops;
 
     for (int i = 0; i < MAXATK; i++) {
@@ -760,7 +765,7 @@ static void attack_start(Env *e, int attacker, int target, float troops) {
         }
         troops -= e->attacks[i].troops;
         e->attacks[i].active = 0;
-        if (troops <= 0.0f) return;
+        if (troops <= 0.0) return;
     }
 
     for (int i = 0; i < MAXATK; i++) {
@@ -770,7 +775,7 @@ static void attack_start(Env *e, int attacker, int target, float troops) {
         e->attacks[i].active = 0;
     }
 
-    if (troops < 1.0f) return;
+    if (troops < 1.0) return;
 
     int i = find_free_slot(e);
     if (i < 0) {
@@ -827,18 +832,18 @@ static void dead_defender(Env *e, int attacker, int target) {
 }
 
 static void attack_tick(Env *e, Attack *a) {
-    float frontier = (float)a->heap.count + rng_int(e, 0, 5);
-    float budget;
+    double frontier = (double)a->heap.count + rng_int(e, 0, 5);
+    double budget;
     if (a->target == 0) {
-        budget = frontier * 2.0f;
+        budget = frontier * 2.0;
     } else {
-        float def = e->players[a->target].troops;
-        if (def <= 0.0f) budget = 0.5f * frontier * 3.0f;
-        else budget = within((5.0f*a->troops / def) * 2.0f, 0.01f, 0.5f) * frontier * 3.0f;
+        double def = e->players[a->target].troops;
+        if (def <= 0.0) budget = 0.5 * frontier * 3.0;
+        else budget = within_d((5.0*a->troops / def) * 2.0, 0.01, 0.5) * frontier * 3.0;
     }
 
-    while (budget > 0.0f) {
-        if (a->troops < 1.0f) { a->active = 0; return; }
+    while (budget > 0.0) {
+        if (a->troops < 1.0) { a->active = 0; return; }
 
         int t = heap_pop(&a->heap);
         if (t < 0) {
@@ -861,33 +866,33 @@ static void attack_tick(Env *e, Attack *a) {
                 atk_push(e, a, nb[k]);
         }
 
-        float mag, speed;
+        double mag, speed;
         int ty = terrain_type(e, t);
-        if      (ty == 2) { mag = 120.0f; speed = 25.0f; }
-        else if (ty == 1) { mag = 100.0f; speed = 20.0f; }
-        else              { mag = 80.0f;  speed = 16.5f; }
+        if      (ty == 2) { mag = 120.0; speed = 25.0; }
+        else if (ty == 1) { mag = 100.0; speed = 20.0; }
+        else              { mag = 80.0;  speed = 16.5; }
 
-        float atk_loss, cost;
+        double atk_loss, cost;
         if (a->target == 0) {
-            atk_loss = e->is_bot[a->attacker] ? mag / 10.0f : mag / 5.0f;
-            cost = within(2000.0f * (speed > 10.0f ? speed : 10.0f) / a->troops, 5.0f, 100.0f);
+            atk_loss = e->is_bot[a->attacker] ? mag / 10.0 : mag / 5.0;
+            cost = within_d(2000.0 * (speed > 10.0 ? speed : 10.0) / a->troops, 5.0, 100.0);
         } else {
-            if (!e->is_bot[a->attacker] && e->is_bot[a->target]) mag *= 0.7f;
+            if (!e->is_bot[a->attacker] && e->is_bot[a->target]) mag *= 0.7;
 
-            float def_troops = e->players[a->target].troops;
-            int   def_tiles  = e->players[a->target].tiles.count;
-            float def_loss = (def_tiles > 0) ? def_troops / def_tiles : 0.0f;
-            float cur_loss = within(def_troops / a->troops, 0.6f, 2.0f) * mag * 0.8f;
-            float alt_loss = 1.3f * def_loss * (mag / 100.0f);
-            atk_loss = 0.6f*cur_loss + 0.4f*alt_loss;
-            cost = within(def_troops / (5.0f * a->troops), 0.2f, 1.5f) * speed;
+            double def_troops = e->players[a->target].troops;
+            int    def_tiles  = e->players[a->target].tiles.count;
+            double def_loss = (def_tiles > 0) ? def_troops / def_tiles : 0.0;
+            double cur_loss = within_d(def_troops / a->troops, 0.6, 2.0) * mag * 0.8;
+            double alt_loss = 1.3 * def_loss * (mag / 100.0);
+            atk_loss = 0.6*cur_loss + 0.4*alt_loss;
+            cost = within_d(def_troops / (5.0 * a->troops), 0.2, 1.5) * speed;
             e->players[a->target].troops -= def_loss;
-            if (e->players[a->target].troops < 0.0f) e->players[a->target].troops = 0.0f;
+            if (e->players[a->target].troops < 0.0) e->players[a->target].troops = 0.0;
         }
 
         budget   -= cost;
         a->troops -= atk_loss;
-        if (a->troops < 0.0f) a->troops = 0.0f;
+        if (a->troops < 0.0) a->troops = 0.0;
         conquer(e, a->attacker, t);
 
         if (a->target != 0 && e->players[a->target].tiles.count < WIPE_TILES)
@@ -989,7 +994,7 @@ static int annex_capturer(Env *e, int p, const int *tiles, int n) {
     if (!any) return 0;
 
     int best = 0;
-    float best_troops = 0.0f;
+    double best_troops = 0.0;
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
         if (e->attacks[i].target != p) continue;
@@ -1105,9 +1110,9 @@ static void bots_init(Env *e) {
     for (int i = 1; i < MAXP; i++) {
         e->bots[i].attack_rate   = rng_int(e, 40, 80);
         e->bots[i].attack_off    = rng_below(e, e->bots[i].attack_rate);
-        e->bots[i].trigger_ratio = rng_int(e, 50, 60) / 100.0f;
-        e->bots[i].reserve_ratio = rng_int(e, 30, 40) / 100.0f;
-        e->bots[i].expand_ratio  = rng_int(e, 10, 20) / 100.0f;
+        e->bots[i].trigger_ratio = rng_int(e, 50, 60) / 100.0;
+        e->bots[i].reserve_ratio = rng_int(e, 30, 40) / 100.0;
+        e->bots[i].expand_ratio  = rng_int(e, 10, 20) / 100.0;
         e->bots[i].neighbors_tn  = 1;
     }
 }
@@ -1149,7 +1154,7 @@ static int bordering_players(Env *e, int p, int *out) {
 
 static int largest_incoming_attacker(Env *e, int p) {
     int best = 0;
-    float best_troops = 0.0f;
+    double best_troops = 0.0;
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
         if (e->attacks[i].target != p) continue;
@@ -1165,8 +1170,8 @@ static int largest_incoming_attacker(Env *e, int p) {
 static void bot_attack_random(Env *e, int p) {
     if (e->players[p].troops < e->bots[p].trigger_ratio * max_troops(e, p)) return;
 
-    float send = e->players[p].troops - max_troops(e, p) * e->bots[p].reserve_ratio;
-    if (send < 1.0f) return;
+    double send = e->players[p].troops - max_troops(e, p) * e->bots[p].reserve_ratio;
+    if (send < 1.0) return;
 
     int r = largest_incoming_attacker(e, p);
     if (r != 0) {
@@ -1196,8 +1201,8 @@ static void bot_tick(Env *e, int p) {
 
     if (e->bots[p].neighbors_tn) {
         if (has_tn_neighbor(e, p)) {
-            float send = e->players[p].troops - max_troops(e, p) * e->bots[p].expand_ratio;
-            if (send >= 1.0f) {
+            double send = e->players[p].troops - max_troops(e, p) * e->bots[p].expand_ratio;
+            if (send >= 1.0) {
                 attack_start(e, p, 0, send);
                 return;
             }
@@ -1369,8 +1374,8 @@ static void check_borders(Env *e) {
                    p, e->players[p].tiles.count, e->players[p].alive);
             exit(1);
         }
-        if (e->players[p].troops < 0.0f) {
-            printf("TROOPS BROKEN: p%d troops=%f\n", p, (double)e->players[p].troops);
+        if (e->players[p].troops < 0.0) {
+            printf("TROOPS BROKEN: p%d troops=%f\n", p, e->players[p].troops);
             exit(1);
         }
         if (e->players[p].troops != e->players[p].troops) {
@@ -1380,8 +1385,8 @@ static void check_borders(Env *e) {
     }
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
-        if (e->attacks[i].troops < 0.0f) {
-            printf("ATTACK TROOPS BROKEN: slot %d troops=%f\n", i, (double)e->attacks[i].troops);
+        if (e->attacks[i].troops < 0.0) {
+            printf("ATTACK TROOPS BROKEN: slot %d troops=%f\n", i, e->attacks[i].troops);
             exit(1);
         }
         if (e->attacks[i].troops != e->attacks[i].troops) {
@@ -1645,12 +1650,19 @@ static unsigned long env_hash(Env *e) {
         h = (h ^ (unsigned long)ty) * 1099511628211UL;
     }
     for (int p = 1; p < MAXP; p++) {
-        unsigned int bits;
-        float tr = e->players[p].troops;
-        memcpy(&bits, &tr, 4);
+        uint64_t bits;
+        double tr = e->players[p].troops;
+        memcpy(&bits, &tr, 8);
         h = (h ^ bits) * 1099511628211UL;
         h = (h ^ (unsigned long)e->players[p].tiles.count) * 1099511628211UL;
         h = (h ^ (unsigned long)e->players[p].alive) * 1099511628211UL;
+    }
+    for (int i = 0; i < MAXATK; i++) {
+        if (!e->attacks[i].active) continue;
+        uint64_t bits;
+        double tr = e->attacks[i].troops;
+        memcpy(&bits, &tr, 8);
+        h = (h ^ bits) * 1099511628211UL;
     }
     h = (h ^ (unsigned long)e->annex_events) * 1099511628211UL;
     h = (h ^ (unsigned long)e->ticks) * 1099511628211UL;
@@ -2038,12 +2050,12 @@ static void compute_observations(Env *e) {
 
         int p = e->seats[a].seat;
         int idx = 0;
-        float troops = e->players[p].troops;
-        float maxt   = max_troops(e, p);
-        int   tiles  = e->players[p].tiles.count;
-        int   border = e->players[p].border.count;
+        double troops = e->players[p].troops;
+        double maxt   = max_troops(e, p);
+        int    tiles  = e->players[p].tiles.count;
+        int    border = e->players[p].border.count;
 
-        obs[idx++] = within(troops / maxt, 0.0f, 1.0f);
+        obs[idx++] = within((float)(troops / maxt), 0.0f, 1.0f);
         obs[idx++] = (float)tiles / e->land_tiles;
         obs[idx++] = tiles ? (float)border / tiles : 0.0f;
         obs[idx++] = has_tn_neighbor(e, p) ? 1.0f : 0.0f;
@@ -2061,9 +2073,9 @@ static void compute_observations(Env *e) {
             obs[idx++] = 1.0f;
             obs[idx++] = shared_total ? (float)nb_shared[k] / shared_total : 0.0f;
             obs[idx++] = (float)e->players[q].tiles.count / e->land_tiles;
-            float mine = troops > 1.0f ? troops : 1.0f;
-            float thrs = e->players[q].troops > 1.0f ? e->players[q].troops : 1.0f;
-            obs[idx++] = within((float)(det_log((double)(thrs / mine)) / DET_LN2), -4.0f, 4.0f) / 8.0f + 0.5f;
+            double mine = troops > 1.0 ? troops : 1.0;
+            double thrs = e->players[q].troops > 1.0 ? e->players[q].troops : 1.0;
+            obs[idx++] = within((float)(det_log(thrs / mine) / DET_LN2), -4.0f, 4.0f) / 8.0f + 0.5f;
             obs[idx++] = 0.0f;
         }
 
@@ -2091,8 +2103,8 @@ static void apply_action(Env *e, int seat_idx) {
     int action = (int)e->agents[seat_idx].actions[0];
     if (action <= 0) return;
 
-    float send = e->players[p].troops / 5.0f;
-    if (send < 1.0f) return;
+    double send = e->players[p].troops / 5.0;
+    if (send < 1.0) return;
 
     if (action == 1) {
         if (has_tn_neighbor(e, p)) attack_start(e, p, 0, send);
