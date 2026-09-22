@@ -2,6 +2,8 @@
    (github.com/openfrontio/OpenFrontIO, AGPL-3.0), commit fc50009.
    Independent C implementation; no source transliterated. */
 
+#pragma STDC FP_CONTRACT OFF
+
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +11,92 @@
 #include <math.h>
 #include <time.h>
 #include "simplex.h"
+
+/* Deterministic transcendentals (spec §2.2). Derived from the approach in
+ * OpenFront.io's src/core/DetMath.ts: only + - * /, floor and IEEE bit
+ * manipulation, all of which IEEE 754 requires to be correctly rounded, so
+ * results are bit-identical on any conforming platform PROVIDED the compiler
+ * does not contract a*b+c into an FMA. Build with -ffp-contract=off, never
+ * with -ffast-math. Accuracy ~1e-8 relative. Inputs assumed finite. */
+#ifndef DETMATH_H
+#define DETMATH_H
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+#define DET_LN2      0.6931471805599453
+#define DET_LOG2E    1.4426950408889634
+#define DET_SQRT2    1.4142135623730951
+#define DET_PI       3.141592653589793
+#define DET_PI_2     1.5707963267948966
+#define DET_PI_4     0.7853981633974483
+#define DET_TAN_PI_8 0.41421356237309503
+
+static inline uint64_t det_bits(double x) { uint64_t u; memcpy(&u, &x, 8); return u; }
+static inline double det_from_bits(uint64_t u) { double x; memcpy(&x, &u, 8); return x; }
+
+/* 2^n, exact. Saturates to inf / 0 (no subnormals). */
+static inline double det_pow2(int n) {
+    if (n > 1023) return INFINITY;
+    if (n < -1022) return 0.0;
+    return det_from_bits((uint64_t)(n + 1023) << 52);
+}
+
+/* e^x. Range-reduce x = n ln2 + r, |r| <= ln2/2, Taylor to r^8. */
+static inline double det_exp(double x) {
+    if (x > 709.0) return INFINITY;
+    if (x < -708.0) return 0.0;
+    double n = floor(x * DET_LOG2E + 0.5);
+    double r = x - n * DET_LN2;
+    double p = 1.0 + r * (1.0 + r * (1.0/2 + r * (1.0/6 + r * (1.0/24
+             + r * (1.0/120 + r * (1.0/720 + r * (1.0/5040 + r * (1.0/40320))))))));
+    return p * det_pow2((int)n);
+}
+
+/* ln x, x > 0. x = m 2^e with m in (sqrt2/2, sqrt2]; ln m = 2 atanh(s). */
+static inline double det_log(double x) {
+    if (x <= 0.0) return x == 0.0 ? -INFINITY : NAN;
+    int e = 0;
+    if (x < 2.2250738585072014e-308) { x *= 18014398509481984.0; e = -54; } /* 2^54 */
+    uint64_t u = det_bits(x);
+    e += (int)((u >> 52) & 0x7ff) - 1023;
+    double m = det_from_bits((u & 0x000FFFFFFFFFFFFFull) | 0x3FF0000000000000ull);
+    if (m > DET_SQRT2) { m *= 0.5; e += 1; }
+    double s = (m - 1.0) / (m + 1.0);
+    double z = s * s;
+    double series = 1.0 + z * (1.0/3 + z * (1.0/5 + z * (1.0/7 + z * (1.0/9
+                  + z * (1.0/11 + z * (1.0/13))))));
+    return e * DET_LN2 + 2.0 * s * series;
+}
+
+/* x^y, x >= 0. */
+static inline double det_pow(double x, double y) {
+    if (y == 0.0 || x == 1.0) return 1.0;
+    if (x == 0.0) return y > 0.0 ? 0.0 : INFINITY;
+    if (x < 0.0) return NAN;
+    return det_exp(y * det_log(x));
+}
+
+/* atan z, z in [0,1]. Fold [tan(pi/8),1] around pi/4, Taylor to z^17. */
+static inline double det_atan_unit(double z) {
+    double base = 0.0;
+    if (z > DET_TAN_PI_8) { base = DET_PI_4; z = (z - 1.0) / (z + 1.0); }
+    double w = z * z;
+    double series = 1.0 - w * (1.0/3 - w * (1.0/5 - w * (1.0/7 - w * (1.0/9
+                  - w * (1.0/11 - w * (1.0/13 - w * (1.0/15 - w / 17.0)))))));
+    return base + z * series;
+}
+
+/* atan2 in (-pi, pi], signed zeros ignored. */
+static inline double det_atan2(double y, double x) {
+    if (y == 0.0) return x >= 0.0 ? 0.0 : DET_PI;
+    if (x == 0.0) return y > 0.0 ? DET_PI_2 : -DET_PI_2;
+    double ax = x < 0.0 ? -x : x, ay = y < 0.0 ? -y : y;
+    double a = ay <= ax ? det_atan_unit(ay / ax) : DET_PI_2 - det_atan_unit(ax / ay);
+    if (x < 0.0) a = DET_PI - a;
+    return y < 0.0 ? -a : a;
+}
+#endif
 
 #define OF_MAX_OCTAVES 16
 
@@ -613,7 +701,7 @@ static void players_reset(Env *e) {
 
 static float max_troops(Env *e, int p) {
     float tiles = (float)e->players[p].tiles.count;
-    float m = 2.0f * (powf(tiles, 0.6f) * 1000.0f + 50000.0f);
+    float m = 2.0f * ((float)det_pow((double)tiles, 0.6) * 1000.0f + 50000.0f);
     if (e->is_bot[p]) m /= 3.0f;
     return m;
 }
@@ -626,7 +714,7 @@ static void player_tick(Env *e, int p) {
     if (!e->players[p].alive) return;
     float max = max_troops(e, p);
     float troops = e->players[p].troops;
-    float add = 10.0f + powf(troops, 0.73f) / 4.0f;
+    float add = 10.0f + (float)det_pow((double)troops, 0.73) / 4.0f;
     add *= (1.0f - troops / max);
     if (e->is_bot[p]) add *= 0.5f;
     troops += add;
@@ -1953,7 +2041,7 @@ static void compute_observations(Env *e) {
             obs[idx++] = (float)e->players[q].tiles.count / e->land_tiles;
             float mine = troops > 1.0f ? troops : 1.0f;
             float thrs = e->players[q].troops > 1.0f ? e->players[q].troops : 1.0f;
-            obs[idx++] = within(log2f(thrs / mine), -4.0f, 4.0f) / 8.0f + 0.5f;
+            obs[idx++] = within((float)(det_log((double)(thrs / mine)) / DET_LN2), -4.0f, 4.0f) / 8.0f + 0.5f;
             obs[idx++] = 0.0f;
         }
 
@@ -2149,3 +2237,4 @@ void puf_log(Log *log, Dict *out) {
 void puf_close(Env *e) {
     (void)e;
 }
+#pragma STDC FP_CONTRACT DEFAULT
