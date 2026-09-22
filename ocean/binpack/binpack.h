@@ -202,6 +202,14 @@ static void bp_generate(Env *e, unsigned int seed) {
         e->cut_stack[top++] = hi;
     }
 
+    int gvol = 0;
+    for (int i = 0; i < e->n_boxes; i++)
+        gvol += e->instance[i].d[0] * e->instance[i].d[1] * e->instance[i].d[2];
+    if (gvol != BP_VOLUME) {
+        fprintf(stderr, "binpack: generator volume %d != %d (seed %u)\n", gvol, BP_VOLUME, seed);
+        abort();
+    }
+
     unsigned int key[BP_MAX_BOXES];
     for (int i = 0; i < e->n_boxes; i++) key[i] = bp_xorshift(&e->gen_rng);
 
@@ -322,8 +330,10 @@ static void bp_place(Env *e, int a) {
                 e->voxel[bp_vox(i, j, k)] = (uint8_t)id;
             }
     for (int j = y; j < y + dy; j++)
-        for (int i = x; i < x + dx; i++)
+        for (int i = x; i < x + dx; i++) {
+            BP_CHECK(e->height[bp_cell(i, j)] < z + dz, "I-S6 column (%d,%d) height would not increase", i, j);
             e->height[bp_cell(i, j)] = (uint8_t)(z + dz);
+        }
 
     BpPlaced *p = &e->placed[e->n_placed];
     p->inst = (uint8_t)e->cursor;
@@ -338,6 +348,8 @@ static void bp_place(Env *e, int a) {
 
 static void bp_check_state(const Env *e) {
     BP_CHECK(e->n_placed <= e->n_boxes && e->n_boxes <= BP_MAX_BOXES, "I-S5 counts");
+    for (int i = 0; i < e->n_placed; i++)
+        BP_CHECK(e->placed[i].inst == i && e->placed[i].inst < e->n_boxes, "I-S5 placed %d -> instance %d", i, e->placed[i].inst);
     int occ = 0;
     for (int v = 0; v < BP_VOLUME; v++) {
         occ += (e->voxel[v] != 0);
