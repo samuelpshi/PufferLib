@@ -592,19 +592,47 @@ static inline void bp_print_mask(const Env *e) {
     }
 }
 
-static void bp_draw_scene(const BpPlaced *pl, int n, const char *hud, const char *hud2) {
-    static Camera3D cam;
-    static int cam_init = 0;
-    if (!cam_init) {
-        cam.position = (Vector3){16.0f, 14.0f, 16.0f};
-        cam.target = (Vector3){0.0f, 3.5f, 0.0f};
-        cam.up = (Vector3){0.0f, 1.0f, 0.0f};
-        cam.fovy = 45.0f;
-        cam.projection = CAMERA_PERSPECTIVE;
-        cam_init = 1;
+typedef struct {
+    float yaw, pitch, dist;
+    int paused, init;
+} BpView;
+
+static BpView bp_view;
+
+static void bp_view_reset(void) {
+    bp_view.yaw = 0.785f;
+    bp_view.pitch = 0.55f;
+    bp_view.dist = 24.0f;
+}
+
+static void bp_view_input(void) {
+    if (!bp_view.init) { bp_view_reset(); bp_view.init = 1; }
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        Vector2 d = GetMouseDelta();
+        bp_view.yaw -= d.x * 0.008f;
+        bp_view.pitch += d.y * 0.008f;
+        if (bp_view.pitch > 1.5f) bp_view.pitch = 1.5f;
+        if (bp_view.pitch < -0.2f) bp_view.pitch = -0.2f;
     }
-    UpdateCamera(&cam, CAMERA_ORBITAL);
+    bp_view.dist -= GetMouseWheelMove() * 1.5f;
+    if (bp_view.dist < 8.0f) bp_view.dist = 8.0f;
+    if (bp_view.dist > 60.0f) bp_view.dist = 60.0f;
+    if (IsKeyPressed(KEY_SPACE)) bp_view.paused = !bp_view.paused;
+    if (IsKeyPressed(KEY_R)) bp_view_reset();
+    if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) exit(0);
+}
+
+static void bp_draw_scene(const BpPlaced *pl, int n, const char *hud, const char *hud2) {
     const float h = (float)BP_SIZE / 2.0f;
+    Camera3D cam;
+    cam.target = (Vector3){0.0f, 3.5f, 0.0f};
+    cam.position = (Vector3){
+        cam.target.x + bp_view.dist * cosf(bp_view.pitch) * sinf(bp_view.yaw),
+        cam.target.y + bp_view.dist * sinf(bp_view.pitch),
+        cam.target.z + bp_view.dist * cosf(bp_view.pitch) * cosf(bp_view.yaw)};
+    cam.up = (Vector3){0.0f, 1.0f, 0.0f};
+    cam.fovy = 45.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
 
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
@@ -626,33 +654,37 @@ static void bp_draw_scene(const BpPlaced *pl, int n, const char *hud, const char
     EndMode3D();
     DrawText(hud, 12, 12, 20, (Color){241, 241, 241, 255});
     if (hud2) DrawText(hud2, 12, 38, 20, (Color){255, 200, 90, 255});
+    DrawText(bp_view.paused ? "PAUSED  space resume | drag rotate | wheel zoom | R reset"
+                            : "space pause | drag rotate | wheel zoom | R reset",
+             12, GetScreenHeight() - 28, 18, (Color){150, 170, 170, 255});
     EndDrawing();
     puf_web_vsync();
+}
+
+static void bp_show(const BpPlaced *pl, int n, const char *hud, const char *hud2, int frames) {
+    for (int f = 0; f < frames || bp_view.paused; f++) {
+        bp_view_input();
+        bp_draw_scene(pl, n, hud, hud2);
+    }
 }
 
 void puf_render(Env *e) {
     if (!IsWindowReady()) {
         InitWindow(900, 760, "BinPack");
-        SetTargetFPS(8);
+        SetTargetFPS(60);
     }
-    if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) exit(0);
-
+    char buf[128];
     if (e->render_hold) {
         e->render_hold = 0;
-        const char *hud = TextFormat("episode done  util %.3f  placed %d/%d",
-                                     (double)e->last_util, e->last_n, e->last_boxes);
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s", hud);
-        for (int f = 0; f < 20 && !WindowShouldClose(); f++)
-            bp_draw_scene(e->last_placed, e->last_n, buf, "full or no legal placement");
-        if (WindowShouldClose()) exit(0);
+        snprintf(buf, sizeof(buf), "episode done  util %.3f  placed %d/%d",
+                 (double)e->last_util, e->last_n, e->last_boxes);
+        bp_show(e->last_placed, e->last_n, buf, "full or no legal placement", 150);
         return;
     }
     const BpBox *b = &e->instance[e->cursor];
-    char buf[128];
     snprintf(buf, sizeof(buf), "util %.3f  box %d/%d  next %dx%dx%d",
              (double)e->vol_placed / BP_VOLUME, e->cursor, e->n_boxes, b->d[0], b->d[1], b->d[2]);
-    bp_draw_scene(e->placed, e->n_placed, buf, NULL);
+    bp_show(e->placed, e->n_placed, buf, NULL, 7);
 }
 
 void puf_init(Env *e, Dict *kwargs) {
