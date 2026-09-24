@@ -161,8 +161,11 @@ typedef struct {
     int   attacker;
     int   target;
     double troops;
+    uint64_t border[OF_N / 64];
+    int      border_size;
     Heap  heap;
 } Attack;
+OF_STATIC_ASSERT(OF_N % 64 == 0, "border bitset needs OF_N % 64 == 0");
 
 typedef struct {
     int attack_rate;
@@ -746,7 +749,18 @@ static int find_free_slot(Env *e) {
     return -1;
 }
 
+static inline void atk_border_add(Attack *a, int t) {
+    uint64_t m = 1ull << (t & 63);
+    if (!(a->border[t >> 6] & m)) { a->border[t >> 6] |= m; a->border_size++; }
+}
+
+static inline void atk_border_remove(Attack *a, int t) {
+    uint64_t m = 1ull << (t & 63);
+    if (a->border[t >> 6] & m) { a->border[t >> 6] &= ~m; a->border_size--; }
+}
+
 static void atk_push(Env *e, Attack *a, int t) {
+    atk_border_add(a, t);
     int ty = terrain_type(e, t);
     float mag = (ty == 0) ? 1.0f : (ty == 1) ? 1.5f : 2.0f;
 
@@ -805,6 +819,8 @@ static void attack_start(Env *e, int attacker, int target, double troops) {
     a->troops   = troops;
 
     heap_init(&a->heap);
+    memset(a->border, 0, sizeof(a->border));
+    a->border_size = 0;
 
     TileSet *b = &e->players[attacker].border;
     for (int j = 0; j < b->count; j++) {
@@ -843,7 +859,9 @@ static void dead_defender(Env *e, int attacker, int target) {
 }
 
 static void attack_tick(Env *e, Attack *a) {
-    double frontier = (double)a->heap.count + rng_int(e, 0, 5);
+    int bs = a->border_size + rng_int(e, 0, 5);
+    double frontier = (double)bs;
+    int one_tile = (bs == 0);
     double budget;
     if (a->target == 0) {
         budget = frontier * 2.0;
@@ -853,7 +871,7 @@ static void attack_tick(Env *e, Attack *a) {
         else budget = within_d((5.0*a->troops / def) * 2.0, 0.01, 0.5) * frontier * 3.0;
     }
 
-    while (budget > 0.0) {
+    while (one_tile || budget > 0.0) {
         if (a->troops < 1.0) { a->active = 0; return; }
 
         int t = heap_pop(&a->heap);
@@ -862,6 +880,7 @@ static void attack_tick(Env *e, Attack *a) {
             a->active = 0;
             return;
         }
+        atk_border_remove(a, t);
 
         if (e->owner[t] != a->target) continue;
         int nb[4];
@@ -907,6 +926,7 @@ static void attack_tick(Env *e, Attack *a) {
 
         if (a->target != 0 && e->players[a->target].tiles.count < WIPE_TILES)
             dead_defender(e, a->attacker, a->target);
+        if (one_tile) break;
     }
 }
 
@@ -1402,6 +1422,14 @@ static void check_borders(Env *e) {
         }
         if (e->attacks[i].troops != e->attacks[i].troops) {
             printf("ATTACK TROOPS NaN: slot %d\n", i);
+            exit(1);
+        }
+        int pop = 0;
+        for (int w = 0; w < OF_N / 64; w++)
+            pop += __builtin_popcountll(e->attacks[i].border[w]);
+        if (pop != e->attacks[i].border_size) {
+            printf("ATTACK BORDER BROKEN: slot %d size=%d pop=%d\n",
+                   i, e->attacks[i].border_size, pop);
             exit(1);
         }
     }
