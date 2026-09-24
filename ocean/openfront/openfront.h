@@ -123,7 +123,7 @@ OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 #define HEAPCAP 2048
 
 #define ANNEX_PERIOD 20
-#define SPAWN_TILES  49
+#define SPAWN_TILES  52   /* upstream §13.2: centre-shifted Euclidean-4 disk */
 #define WIPE_TILES   (SPAWN_TILES/3)
 #define ANNEX_TILES  WIPE_TILES
 
@@ -1240,10 +1240,15 @@ static int win_check(Env *e) {
 
 // spawn placement
 
+/* (dx+0.5)^2 + (dy+0.5)^2 <= R^2, doubled to stay in integers. Offsets span -R..R-1. */
+static inline int in_spawn_disk(int dx, int dy) {
+    return (2*dx+1)*(2*dx+1) + (2*dy+1)*(2*dy+1) <= 4*SPAWN_RADIUS*SPAWN_RADIUS;
+}
+
 static int spawn_disk_ok(Env *e, int cx, int cy) {
     for (int dy = -SPAWN_RADIUS; dy <= SPAWN_RADIUS; dy++) {
         for (int dx = -SPAWN_RADIUS; dx <= SPAWN_RADIUS; dx++) {
-            if (dx*dx + dy*dy > SPAWN_RADIUS*SPAWN_RADIUS) continue;
+            if (!in_spawn_disk(dx, dy)) continue;
             int x = cx + dx, y = cy + dy;
             if (x < 0 || x >= OF_W || y < 0 || y >= OF_H) return 0;
             int t = ref(x, y);
@@ -1284,7 +1289,7 @@ static int spawn_place(Env *e, int p) {
 
         for (int dy = -SPAWN_RADIUS; dy <= SPAWN_RADIUS; dy++)
             for (int dx = -SPAWN_RADIUS; dx <= SPAWN_RADIUS; dx++) {
-                if (dx*dx + dy*dy > SPAWN_RADIUS*SPAWN_RADIUS) continue;
+                if (!in_spawn_disk(dx, dy)) continue;
                 conquer(e, p, ref(cx + dx, cy + dy));
             }
         e->spawn_center[p] = c;
