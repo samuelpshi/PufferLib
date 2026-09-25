@@ -247,6 +247,8 @@ struct Env {
     Bot    bots[MAXP];
     int    spawn_center[MAXP];
 
+    double lt_sig[OF_N + 1];   /* lt_sigmoid(n), n = 0..OF_N; filled at init */
+
     unsigned int cl_visited[OF_N];
     unsigned int cl_gen;
     int cl_stack[OF_N];
@@ -880,10 +882,21 @@ static inline double det_sigmoid(double v, double k, double m) {
     return 1.0 / (1.0 + det_exp(-k * (v - m)));
 }
 
-/* log-logistic territory bonus: ~1 for small n, -> 1 - depth for huge n */
-static inline double large_territory_bonus(int n, double depth) {
-    return 1.0 - depth * det_sigmoid(det_log((double)n), LT_STEEPNESS,
-                                     det_log(LT_MIDPOINT));
+/* log-logistic territory bonus is 1 - depth * lt_sigmoid(n): ~1 for small n,
+   -> 1 - depth for huge n. The sim reads e->lt_sig via lt_sig(); this direct
+   form fills the table and serves n > OF_N in the golden-vector test. */
+static inline double lt_sigmoid(int n) {
+    return det_sigmoid(det_log((double)n), LT_STEEPNESS, det_log(LT_MIDPOINT));
+}
+
+static inline double lt_sig(Env *e, int n) {
+#ifdef DEBUG
+    if (n < 0 || n > OF_N) {
+        printf("LT_SIG BROKEN: n = %d outside [0, %d]\n", n, OF_N);
+        exit(1);
+    }
+#endif
+    return e->lt_sig[n];
 }
 
 typedef struct { double atk_loss, def_loss, frac; } AtkResult;
@@ -892,10 +905,11 @@ typedef struct { double atk_loss, def_loss, frac; } AtkResult;
    nullius. has_post is 0 until Tier B-lite. Fallout (Tier D) and
    traitor/disconnected-teammate (Tier E/H) are omitted: all x1.
    bs == 0 returns frac 0; the caller's one_tile flag ends the tick after one
-   conquest (upstream divides by zero -> Infinity). */
+   conquest (upstream divides by zero -> Infinity).
+   atk_sig / def_sig are lt_sigmoid(attacker tiles) / lt_sigmoid(def_tiles). */
 static AtkResult attack_logic(int ty, double atk_troops, int atk_is_bot,
-                              int atk_tiles, int def_player, int def_is_bot,
-                              int def_tiles, double def_troops,
+                              double atk_sig, int def_player, int def_is_bot,
+                              int def_tiles, double def_sig, double def_troops,
                               int has_post, int bs) {
     double mag, tile_cost;
     if      (ty == 2) { mag = 120.0; tile_cost = 25.0; }
@@ -913,15 +927,15 @@ static AtkResult attack_logic(int ty, double atk_troops, int atk_is_bot,
     }
 
     if (!atk_is_bot && def_is_bot) mag *= BOT_DEFENDER_LOSS_MULT;
-    double lab = large_territory_bonus(atk_tiles, LT_ATK_DEPTH);
-    double ldb = large_territory_bonus(def_tiles, LT_DEF_DEPTH);
+    double lab = 1.0 - LT_ATK_DEPTH * atk_sig;
+    double ldb = 1.0 - LT_DEF_DEPTH * def_sig;
     r.def_loss = def_troops / def_tiles;
     double ratio = def_troops / atk_troops;
     r.atk_loss = mag * within_d(ratio, 0.6, 2.0)
                * (ATK_LOSS_BASE * lab * ldb + ATK_LOSS_PER_DENSITY * r.def_loss);
     double speed = within_d(ratio, 0.82, 7.5) * within_d(ratio / 20.0, 1.0, 50.0)
                  / SPEED_COST_DIVISOR;
-    double lasb = large_territory_bonus(atk_tiles, LT_ATK_SPEED_DEPTH);
+    double lasb = 1.0 - LT_ATK_SPEED_DEPTH * atk_sig;
     r.frac = bs > 0 ? (speed * tile_cost * lasb * ldb) / bs : 0.0;
     return r;
 }
@@ -964,10 +978,12 @@ static void attack_tick(Env *e, Attack *a) {
             exit(1);
         }
 #endif
+        int atk_n = e->players[a->attacker].tiles.count;
+        int def_n = tp ? e->players[tp].tiles.count : 0;
         AtkResult r = attack_logic(ty, a->troops, e->is_bot[a->attacker],
-                                   e->players[a->attacker].tiles.count,
+                                   lt_sig(e, atk_n),
                                    tp != 0, tp ? e->is_bot[tp] : 0,
-                                   tp ? e->players[tp].tiles.count : 0,
+                                   def_n, lt_sig(e, def_n),
                                    tp ? (double)e->players[tp].troops : 0.0,
                                    0, bs);
         tick_budget -= r.frac;
@@ -1458,12 +1474,19 @@ static void sim_reset(Env *e) {
     }
 }
 
+/* n-only lookup tables. Called by sim_init and puf_init: the framework
+   callocs Env and calls puf_init, never sim_init. */
+static void tables_init(Env *e) {
+    for (int n = 0; n <= OF_N; n++) e->lt_sig[n] = lt_sigmoid(n);
+}
+
 static void sim_init(Env *e, unsigned int seed) {
     memset(e, 0, sizeof(*e));
     rng_seed(e, seed);
     map_rng_seed(e, seed);
     e->cl_gen = 0;
     e->ff_gen = 0;
+    tables_init(e);
 }
 
 #ifdef DEBUG
@@ -1874,8 +1897,9 @@ static void attack_logic_test(void) {
     };
     for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++) {
         AtkResult r = attack_logic(c[i].ty, c[i].atk_troops, c[i].atk_is_bot,
-                                   c[i].atk_tiles, c[i].def_player,
+                                   lt_sigmoid(c[i].atk_tiles), c[i].def_player,
                                    c[i].def_is_bot, c[i].def_tiles,
+                                   lt_sigmoid(c[i].def_tiles),
                                    c[i].def_troops, c[i].has_post, c[i].bs);
         const char *name[3] = {"atk_loss", "def_loss", "frac"};
         double got[3] = {r.atk_loss, r.def_loss, r.frac};
@@ -1888,9 +1912,9 @@ static void attack_logic_test(void) {
             }
         }
     }
-    double ltb = large_territory_bonus(300000, LT_ATK_DEPTH);
+    double ltb = 1.0 - LT_ATK_DEPTH * lt_sigmoid(300000);
     if (fabs(ltb - 0.65) > 1e-12) {
-        printf("attack_logic BROKEN: large_territory_bonus(300000, 0.7) = %.17g\n", ltb);
+        printf("attack_logic BROKEN: 1 - 0.7 * lt_sigmoid(300000) = %.17g\n", ltb);
         exit(1);
     }
     printf("attack_logic ok\n");
@@ -2474,6 +2498,7 @@ void puf_init(Env *e, Dict *kwargs) {
     map_rng_seed(e, ms != 0u ? ms : 123456789u);
 
     rng_seed(e, e->rng);
+    tables_init(e);
 
     for (int i = 0; i < e->num_agents; i++) {
         e->agents[i].policy      = 0;
