@@ -1,5 +1,6 @@
 /* Territory conquest sim. Mechanics derived from OpenFrontIO
-   (github.com/openfrontio/OpenFrontIO, AGPL-3.0), commit fc50009.
+   (github.com/openfrontio/OpenFrontIO, AGPL-3.0), commit 7defd24:
+   core land combat, growth, annexation and bots; no boats, nukes or alliances.
    Independent C implementation; no source transliterated. */
 
 #pragma STDC FP_CONTRACT OFF
