@@ -11,6 +11,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <inttypes.h>
 #include "simplex.h"
 
 /* Deterministic transcendentals (spec §2.2). Derived from the approach in
@@ -137,6 +138,10 @@ OF_STATIC_ASSERT(OF_W <= 255 && OF_H <= 255, "cl_box stores coordinates as uint8
 #define START_TROOPS_HUMAN 25000.0
 #define START_TROOPS_BOT   10000.0
 
+#define GOLD_MULT       10.0   /* goldMultiplier: rescale, reference §4 */
+#define GOLD_BASE_HUMAN 100.0
+#define GOLD_BASE_BOT   50.0
+
 /* Config.attackLogic constants (spec 9) */
 #define LT_MIDPOINT            300000.0
 #define LT_STEEPNESS           2.5
@@ -167,7 +172,9 @@ typedef struct {
     TileSet tiles;
     TileSet border;
     int64_t troops;
+    int64_t gold;
     int alive;
+    int sent_attack;   /* upstream ATTACK_INDEX_SENT != 0; see attack_start */
 } Player;
 
 typedef struct {
@@ -731,6 +738,8 @@ static void players_reset(Env *e) {
         ts_init(&e->players[p].tiles);
         ts_init(&e->players[p].border);
         troops_set(e, p, 0.0);
+        e->players[p].gold        = 0;
+        e->players[p].sent_attack = 0;
         e->players[p].alive  = 0;   /* nobody owns tiles until spawn_place runs */
         e->is_bot[p]         = 1;
         e->last_calc[p]        = (long)(p * 7 % ANNEX_PERIOD);
@@ -761,8 +770,15 @@ static double start_troops(Env *e, int p) {
     return e->is_bot[p] ? START_TROOPS_BOT : START_TROOPS_HUMAN;
 }
 
+static int64_t gold_rate(Env *e, int p) {
+    double base = e->is_bot[p] ? GOLD_BASE_BOT : GOLD_BASE_HUMAN;
+    return (int64_t)floor(base * GOLD_MULT);
+}
+
+/* PlayerExecution.tick (spec 6.1): death (3), troop growth (4), gold (5).
+   Annexation (8) is annex_tick, called right after this by sim_tick. */
 static void player_tick(Env *e, int p) {
-    if (!e->players[p].alive) return;
+    if (!e->players[p].alive) { e->players[p].gold = 0; return; }
     double max = max_troops(e, p);
     double t = (double)e->players[p].troops;
     double add = 10.0 + det_pow(t, 0.73) / 4.0;
@@ -770,6 +786,16 @@ static void player_tick(Env *e, int p) {
     if (e->is_bot[p]) add *= 0.5;
     double inc = fmin(t + add, max) - t;
     troops_add(e, p, inc);
+    e->players[p].gold += gold_rate(e, p);
+}
+
+/* conquerPlayer's gold transfer (spec 5.3). A human who never sent an attack
+   keeps its gold here; player_tick's death step deletes it. */
+static void conquer_player_gold(Env *e, int conqueror, int conquered) {
+    Player *d = &e->players[conquered];
+    if (!e->is_bot[conquered] && !d->sent_attack) return;
+    e->players[conqueror].gold += e->is_bot[conquered] ? d->gold : d->gold / 2;
+    d->gold = 0;
 }
 
 // attack
@@ -811,6 +837,10 @@ static void attack_start(Env *e, int attacker, int target, double troops) {
     if (troops > (double)e->players[attacker].troops) troops = (double)e->players[attacker].troops;
     if (troops < 1.0) return;
     troops = (double)troops_remove(e, attacker, troops);
+    /* Upstream records the SENT stat here: after removeTroops, before
+       cancellation. Only a player-ordered retreat reverses it, and retreat is
+       not an action, so a flag is equivalent. Always >= 1 troop here. */
+    e->players[attacker].sent_attack = 1;
 
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
@@ -867,6 +897,7 @@ static void attack_start(Env *e, int attacker, int target, double troops) {
 
 static void dead_defender(Env *e, int attacker, int target) {
     if (target == 0) return;
+    conquer_player_gold(e, attacker, target);   /* every trigger, spec 10 */
 
     for (int pass = 0; pass < 100; pass++) {
         int progress = 0;
@@ -1151,6 +1182,7 @@ static void annex_remove(Env *e, int p, const int *tiles, int n) {
         }
     }
 
+    if (ntake == e->players[p].tiles.count) conquer_player_gold(e, cap, p);
     for (int i = 0; i < ntake; i++) conquer(e, cap, e->ff_take[i]);
 
     e->annex_events++;
@@ -1570,6 +1602,10 @@ static void check_borders(Env *e) {
             printf("TROOPS BROKEN: p%d troops=%lld\n", p, (long long)e->players[p].troops);
             exit(1);
         }
+        if (e->players[p].gold < 0) {
+            printf("GOLD BROKEN: p%d gold=%" PRId64 "\n", p, e->players[p].gold);
+            exit(1);
+        }
     }
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
@@ -1849,6 +1885,8 @@ static unsigned long env_hash(Env *e) {
         h = (h ^ (uint64_t)e->players[p].troops) * 1099511628211UL;
         h = (h ^ (unsigned long)e->players[p].tiles.count) * 1099511628211UL;
         h = (h ^ (unsigned long)e->players[p].alive) * 1099511628211UL;
+        h = (h ^ (uint64_t)e->players[p].gold) * 1099511628211UL;
+        h = (h ^ (unsigned long)e->players[p].sent_attack) * 1099511628211UL;
     }
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
@@ -2260,6 +2298,125 @@ static void map_test(void) {
     printf("  spawn failures: %ld over %d maps\n", total_sfail, nm);
 }
 
+static void gold_expect(const char *what, int64_t got, int64_t want) {
+    if (got == want) return;
+    printf("GOLD BROKEN: %s: got %" PRId64 " want %" PRId64 "\n", what, got, want);
+    exit(1);
+}
+
+static void gold_run_attacks(Env *e, int target) {
+    for (int it = 0; it < 100 && e->players[target].alive; it++)
+        for (int i = 0; i < MAXATK; i++)
+            if (e->attacks[i].active) attack_tick(e, &e->attacks[i]);
+}
+
+static void gold_test(void) {
+    Env *e = test_env(6);
+    Player *pl = e->players;
+
+    /* Income through sim_tick. Two 5x5 islands, so no bot has a target. */
+    memset(e->terrain, OF_OCEAN_BIT | 1, sizeof(e->terrain));
+    for (int y = 0; y < 5; y++)
+        for (int x = 0; x < 5; x++) {
+            e->terrain[ref(10 + x, 10 + y)] = OF_LAND_BIT | 5;
+            e->terrain[ref(30 + x, 30 + y)] = OF_LAND_BIT | 5;
+        }
+    e->land_tiles = 50;
+    players_reset(e);
+    bots_init(e);
+    for (int i = 0; i < MAXATK; i++) e->attacks[i].active = 0;
+    fill_rect(e, 1, 10, 10, 5, 5);
+    fill_rect(e, 2, 30, 30, 5, 5);
+    e->is_bot[1] = 0;
+    troops_set(e, 1, start_troops(e, 1));
+    troops_set(e, 2, start_troops(e, 2));
+    e->ticks = 0;
+    for (int i = 0; i < 137; i++) sim_tick(e);
+    gold_expect("human income, 137 ticks", pl[1].gold, 137 * 1000);
+    gold_expect("bot income, 137 ticks", pl[2].gold, 137 * 500);
+    gold_expect("island p1 tiles", pl[1].tiles.count, 25);
+    gold_expect("never-alive p5", pl[5].gold, 0);
+
+    /* sent_attack: set by a real attack_start, not by a 0-troop one. */
+    gold_expect("sent_attack before", pl[1].sent_attack, 0);
+    attack_start(e, 4, 0, 5.0);        /* p4 has 0 troops: returns early */
+    gold_expect("sent_attack, 0-troop", pl[4].sent_attack, 0);
+    attack_start(e, 1, 0, 100.0);
+    gold_expect("sent_attack, real", pl[1].sent_attack, 1);
+
+    /* Transfer rules (spec 5.3). p3 is dead; p1 conquers it. */
+    int64_t g = pl[1].gold;
+    e->is_bot[3] = 1; pl[3].sent_attack = 0; pl[3].gold = 12345;
+    conquer_player_gold(e, 1, 3);      /* bot: all, sent_attack irrelevant */
+    gold_expect("bot conquered, conqueror", pl[1].gold, g + 12345);
+    gold_expect("bot conquered, conquered", pl[3].gold, 0);
+    g = pl[1].gold;
+    e->is_bot[3] = 0; pl[3].sent_attack = 1; pl[3].gold = 12345;
+    conquer_player_gold(e, 1, 3);      /* human who attacked: half, truncated */
+    gold_expect("human conquered, conqueror", pl[1].gold, g + 6172);
+    gold_expect("human conquered, conquered", pl[3].gold, 0);
+    g = pl[1].gold;
+    e->is_bot[3] = 0; pl[3].sent_attack = 0; pl[3].gold = 12345;
+    conquer_player_gold(e, 1, 3);      /* human who never attacked: skip */
+    gold_expect("passive human, conqueror", pl[1].gold, g);
+    gold_expect("passive human, conquered", pl[3].gold, 12345);
+    player_tick(e, 3);                 /* death step (spec 6.1.3) */
+    gold_expect("dead player", pl[3].gold, 0);
+
+    /* Wipe site: bot p2 (9 tiles < WIPE_TILES) is wiped on p1's first
+       conquest; dead_defender pays p1 all of p2's gold. */
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+    e->land_tiles = OF_N;
+    players_reset(e);
+    for (int i = 0; i < MAXATK; i++) e->attacks[i].active = 0;
+    e->ticks = 100;
+    fill_rect(e, 1, 10, 10, 10, 10);
+    fill_rect(e, 2, 20, 10, 3, 3);
+    e->is_bot[1] = 0;
+    troops_set(e, 1, 100000.0);
+    pl[2].gold = 777;
+    attack_start(e, 1, 2, 50000.0);
+    gold_run_attacks(e, 2);
+    check_borders(e);
+    gold_expect("wipe: p2 alive", pl[2].alive, 0);
+    gold_expect("wipe: p1", pl[1].gold, 777);
+    gold_expect("wipe: p2", pl[2].gold, 0);
+
+    /* Annex site, whole territory: human p2 that attacked, enclave in p1. */
+    players_reset(e);
+    e->ticks = 100;
+    fill_rect(e, 1, 10, 10, 12, 12);
+    fill_rect(e, 2, 15, 15, 3, 3);
+    e->is_bot[2] = 0;
+    pl[2].sent_attack = 1;
+    pl[2].gold = 1001;
+    long before = e->annex_events;
+    annex_force(e, 2);
+    check_borders(e);
+    gold_expect("annex whole: events", e->annex_events, before + 1);
+    gold_expect("annex whole: p2 alive", pl[2].alive, 0);
+    gold_expect("annex whole: p1", pl[1].gold, 500);
+    gold_expect("annex whole: p2", pl[2].gold, 0);
+
+    /* Annex site, partial: bot p2's enclave goes, its 5x5 in TN stays. */
+    players_reset(e);
+    e->ticks = 100;
+    fill_rect(e, 1, 10, 10, 12, 12);
+    fill_rect(e, 2, 15, 15, 3, 3);
+    fill_rect(e, 2, 30, 30, 5, 5);
+    pl[2].gold = 999;
+    before = e->annex_events;
+    annex_force(e, 2);
+    check_borders(e);
+    gold_expect("annex partial: events", e->annex_events, before + 1);
+    gold_expect("annex partial: p2 tiles", pl[2].tiles.count, 25);
+    gold_expect("annex partial: p1", pl[1].gold, 0);
+    gold_expect("annex partial: p2", pl[2].gold, 999);
+
+    printf("gold ok: income, transfer rules, wipe and annex sites\n");
+    free(e);
+}
+
 static void run_tests(void) {
     ts_test();
     conquer_test();
@@ -2272,6 +2429,7 @@ static void run_tests(void) {
     isolation_test();
     map_test();
     annex_shore_test();
+    gold_test();
 }
 #else
 static void run_tests(void) {}
