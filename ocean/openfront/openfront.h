@@ -135,6 +135,18 @@ OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 #define START_TROOPS_HUMAN 25000.0
 #define START_TROOPS_BOT   10000.0
 
+/* Config.attackLogic constants (spec 9) */
+#define LT_MIDPOINT            300000.0
+#define LT_STEEPNESS           2.5
+#define LT_ATK_DEPTH           0.7
+#define LT_DEF_DEPTH           0.3
+#define LT_ATK_SPEED_DEPTH     0.73
+#define ATK_LOSS_BASE          0.463
+#define ATK_LOSS_PER_DENSITY   0.0039
+#define SPEED_COST_DIVISOR     8.55
+#define TN_COST_SCALE          2000.0
+#define BOT_DEFENDER_LOSS_MULT 0.7
+
 // types
 
 typedef struct {
@@ -858,20 +870,62 @@ static void dead_defender(Env *e, int attacker, int target) {
     }
 }
 
-static void attack_tick(Env *e, Attack *a) {
-    int bs = a->border_size + rng_int(e, 0, 5);
-    double frontier = (double)bs;
-    int one_tile = (bs == 0);
-    double budget;
-    if (a->target == 0) {
-        budget = frontier * 2.0;
-    } else {
-        double def = (double)e->players[a->target].troops;
-        if (def <= 0.0) budget = 0.5 * frontier * 3.0;
-        else budget = within_d((5.0*a->troops / def) * 2.0, 0.01, 0.5) * frontier * 3.0;
+static inline double det_sigmoid(double v, double k, double m) {
+    return 1.0 / (1.0 + det_exp(-k * (v - m)));
+}
+
+/* log-logistic territory bonus: ~1 for small n, -> 1 - depth for huge n */
+static inline double large_territory_bonus(int n, double depth) {
+    return 1.0 - depth * det_sigmoid(det_log((double)n), LT_STEEPNESS,
+                                     det_log(LT_MIDPOINT));
+}
+
+typedef struct { double atk_loss, def_loss, frac; } AtkResult;
+
+/* Pure: mirrors Config.attackLogic (spec 9). def_player == 0 means terra
+   nullius. has_post is 0 until Tier B-lite. Fallout (Tier D) and
+   traitor/disconnected-teammate (Tier E/H) are omitted: all x1.
+   bs == 0 returns frac 0; the caller's one_tile flag ends the tick after one
+   conquest (upstream divides by zero -> Infinity). */
+static AtkResult attack_logic(int ty, double atk_troops, int atk_is_bot,
+                              int atk_tiles, int def_player, int def_is_bot,
+                              int def_tiles, double def_troops,
+                              int has_post, int bs) {
+    double mag, tile_cost;
+    if      (ty == 2) { mag = 120.0; tile_cost = 25.0; }
+    else if (ty == 1) { mag = 100.0; tile_cost = 20.0; }
+    else              { mag = 80.0;  tile_cost = 16.5; }
+    if (def_player && has_post) { mag *= 5.0; tile_cost *= 3.0; }
+
+    AtkResult r;
+    if (!def_player) {
+        r.atk_loss = mag / (atk_is_bot ? 10.0 : 5.0);
+        r.def_loss = 0.0;
+        r.frac = bs > 0 ? within_d(TN_COST_SCALE * tile_cost / atk_troops,
+                                   5.0, 100.0) / (bs * 2.0) : 0.0;
+        return r;
     }
 
-    while (one_tile || budget > 0.0) {
+    if (!atk_is_bot && def_is_bot) mag *= BOT_DEFENDER_LOSS_MULT;
+    double lab = large_territory_bonus(atk_tiles, LT_ATK_DEPTH);
+    double ldb = large_territory_bonus(def_tiles, LT_DEF_DEPTH);
+    r.def_loss = def_troops / def_tiles;
+    double ratio = def_troops / atk_troops;
+    r.atk_loss = mag * within_d(ratio, 0.6, 2.0)
+               * (ATK_LOSS_BASE * lab * ldb + ATK_LOSS_PER_DENSITY * r.def_loss);
+    double speed = within_d(ratio, 0.82, 7.5) * within_d(ratio / 20.0, 1.0, 50.0)
+                 / SPEED_COST_DIVISOR;
+    double lasb = large_territory_bonus(atk_tiles, LT_ATK_SPEED_DEPTH);
+    r.frac = bs > 0 ? (speed * tile_cost * lasb * ldb) / bs : 0.0;
+    return r;
+}
+
+static void attack_tick(Env *e, Attack *a) {
+    int bs = a->border_size + rng_int(e, 0, 5);
+    int one_tile = (bs == 0);
+    double tick_budget = 1.0;
+
+    while (one_tile || tick_budget > 0.0) {
         if (a->troops < 1.0) { a->active = 0; return; }
 
         int t = heap_pop(&a->heap);
@@ -896,32 +950,24 @@ static void attack_tick(Env *e, Attack *a) {
                 atk_push(e, a, nb[k]);
         }
 
-        double mag, speed;
         int ty = terrain_type(e, t);
-        if      (ty == 2) { mag = 120.0; speed = 25.0; }
-        else if (ty == 1) { mag = 100.0; speed = 20.0; }
-        else              { mag = 80.0;  speed = 16.5; }
-
-        double atk_loss, cost;
-        if (a->target == 0) {
-            atk_loss = e->is_bot[a->attacker] ? mag / 10.0 : mag / 5.0;
-            cost = within_d(2000.0 * (speed > 10.0 ? speed : 10.0) / a->troops, 5.0, 100.0);
-        } else {
-            if (!e->is_bot[a->attacker] && e->is_bot[a->target]) mag *= 0.7;
-
-            double def_troops = (double)e->players[a->target].troops;
-            int    def_tiles  = e->players[a->target].tiles.count;
-            double def_loss = (def_tiles > 0) ? def_troops / def_tiles : 0.0;
-            double cur_loss = within_d(def_troops / a->troops, 0.6, 2.0) * mag * 0.8;
-            double alt_loss = 1.3 * def_loss * (mag / 100.0);
-            atk_loss = 0.6*cur_loss + 0.4*alt_loss;
-            cost = within_d(def_troops / (5.0 * a->troops), 0.2, 1.5) * speed;
-            troops_remove(e, a->target, def_loss);
+        int tp = a->target;
+#ifdef DEBUG
+        if (tp != 0 && e->players[tp].tiles.count < 1) {
+            printf("DEF TILES BROKEN\n");
+            exit(1);
         }
-
-        budget   -= cost;
-        a->troops -= atk_loss;
+#endif
+        AtkResult r = attack_logic(ty, a->troops, e->is_bot[a->attacker],
+                                   e->players[a->attacker].tiles.count,
+                                   tp != 0, tp ? e->is_bot[tp] : 0,
+                                   tp ? e->players[tp].tiles.count : 0,
+                                   tp ? (double)e->players[tp].troops : 0.0,
+                                   0, bs);
+        tick_budget -= r.frac;
+        a->troops -= r.atk_loss;
         if (a->troops < 0.0) a->troops = 0.0;
+        if (tp != 0) troops_remove(e, tp, r.def_loss);
         conquer(e, a->attacker, t);
 
         if (a->target != 0 && e->players[a->target].tiles.count < WIPE_TILES)
@@ -1705,6 +1751,48 @@ static unsigned long env_hash(Env *e) {
     return h;
 }
 
+static void attack_logic_test(void) {
+    static const struct {
+        int ty; double atk_troops; int atk_is_bot, atk_tiles;
+        int def_player, def_is_bot, def_tiles; double def_troops;
+        int has_post, bs;
+        double atk_loss, def_loss, frac;
+    } c[] = {
+        {0, 5000.0,  1, 60,  0, 0, 0,      0.0,     0, 7,
+         8.0, 0.0, 0.47142857142857142},
+        {1, 300.0,   0, 120, 0, 0, 0,      0.0,     0, 3,
+         20.0, 0.0, 16.666666666666668},
+        {0, 8000.0,  0, 150, 1, 1, 90,     12000.0, 0, 10,
+         82.571999829622996, 133.33333333333334, 0.28947368289386166},
+        {2, 1500.0,  1, 80,  1, 1, 200,    40000.0, 0, 4,
+         298.31999952712664, 200.0, 7.3099414891055803},
+        {0, 20000.0, 1, 400, 1, 0, 300000, 1e6,     0, 5,
+         65.047997138691059, 3.3333333333333335, 6.1513154979742621},
+    };
+    for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++) {
+        AtkResult r = attack_logic(c[i].ty, c[i].atk_troops, c[i].atk_is_bot,
+                                   c[i].atk_tiles, c[i].def_player,
+                                   c[i].def_is_bot, c[i].def_tiles,
+                                   c[i].def_troops, c[i].has_post, c[i].bs);
+        const char *name[3] = {"atk_loss", "def_loss", "frac"};
+        double got[3] = {r.atk_loss, r.def_loss, r.frac};
+        double want[3] = {c[i].atk_loss, c[i].def_loss, c[i].frac};
+        for (int f = 0; f < 3; f++) {
+            if (fabs(got[f] - want[f]) > 1e-9 * fabs(want[f])) {
+                printf("attack_logic BROKEN: case %d %s got %.17g expected %.17g\n",
+                       i, name[f], got[f], want[f]);
+                exit(1);
+            }
+        }
+    }
+    double ltb = large_territory_bonus(300000, LT_ATK_DEPTH);
+    if (fabs(ltb - 0.65) > 1e-12) {
+        printf("attack_logic BROKEN: large_territory_bonus(300000, 0.7) = %.17g\n", ltb);
+        exit(1);
+    }
+    printf("attack_logic ok\n");
+}
+
 #define ISO_ENVS    3
 #define ISO_EPS     3
 #define ISO_TICKS 800
@@ -2038,6 +2126,7 @@ static void run_tests(void) {
     heap_test();
     annex_test();
     attack_test();
+    attack_logic_test();
     isolation_test();
     map_test();
     annex_shore_test();
