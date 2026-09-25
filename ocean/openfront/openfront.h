@@ -1048,10 +1048,14 @@ static int annex_enclosed(Env *e, int p, int start) {
     return 1;
 }
 
+/* getCapturingPlayer: largest ongoing attack against p among adjacent
+   players, else getMode over adjacencies. Every adjacency counts (no per-tile
+   dedup); ties go to the first-encountered owner. */
 static int annex_capturer(Env *e, int p, const int *tiles, int n) {
     int cnt[MAXP];
+    int order[MAXP];
+    int norder = 0;
     memset(cnt, 0, sizeof(cnt));
-    int any = 0;
 
     for (int i = 0; i < n; i++) {
         int nb[4];
@@ -1059,32 +1063,29 @@ static int annex_capturer(Env *e, int p, const int *tiles, int n) {
         for (int j = 0; j < k; j++) {
             int o = e->owner[nb[j]];
             if (o == 0 || o == p) continue;
-            int dup = 0;
-            for (int m = 0; m < j; m++)
-                if (e->owner[nb[m]] == o) { dup = 1; break; }
-            if (dup) continue;
+            if (cnt[o] == 0) order[norder++] = o;
             cnt[o]++;
-            any = 1;
         }
     }
-    if (!any) return 0;
+    if (norder == 0) return 0;
 
     int best = 0;
     double best_troops = 0.0;
-    for (int i = 0; i < MAXATK; i++) {
-        if (!e->attacks[i].active) continue;
-        if (e->attacks[i].target != p) continue;
-        if (cnt[e->attacks[i].attacker] == 0) continue;
-        if (e->attacks[i].troops > best_troops) {
-            best_troops = e->attacks[i].troops;
-            best = e->attacks[i].attacker;
+    for (int k = 0; k < norder; k++) {
+        for (int i = 0; i < MAXATK; i++) {
+            Attack *a = &e->attacks[i];
+            if (!a->active || a->attacker != order[k] || a->target != p) continue;
+            if (a->troops > best_troops) {
+                best_troops = a->troops;
+                best = order[k];
+            }
         }
     }
     if (best != 0) return best;
 
     int mode = 0, mode_cnt = 0;
-    for (int q = 1; q < MAXP; q++)
-        if (cnt[q] > mode_cnt) { mode_cnt = cnt[q]; mode = q; }
+    for (int k = 0; k < norder; k++)
+        if (cnt[order[k]] > mode_cnt) { mode_cnt = cnt[order[k]]; mode = order[k]; }
     return mode;
 }
 
