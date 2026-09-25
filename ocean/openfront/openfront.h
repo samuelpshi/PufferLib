@@ -117,6 +117,7 @@ OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
 #define OF_W 48
 #define OF_H 48
 #define OF_N (OF_W*OF_H)
+OF_STATIC_ASSERT(OF_W <= 255 && OF_H <= 255, "cl_box stores coordinates as uint8_t");
 #define MAXP 9
 #define MAXATK 32
 
@@ -251,6 +252,10 @@ struct Env {
     int cl_comp[OF_N];
     int cl_start[OF_N];
     int cl_size[OF_N];
+    uint8_t cl_box[OF_N][4];   /* annex cluster bbox: minx, miny, maxx, maxy */
+    int cl_terr[OF_N];         /* annex cluster -> territory id, 0 = unknown */
+    int cl_of[OF_N];           /* tile -> annex cluster; valid iff cl_visited == cl_gen */
+    int cl_next_terr;
 
     unsigned int ff_visited[OF_N];
     unsigned int ff_gen;
@@ -1125,6 +1130,54 @@ static void annex_remove(Env *e, int p, const int *tiles, int n) {
     e->annex_tiles_moved += ntake;
 }
 
+/* checkAndAssignTerritory: are clusters a and b in the same 8-connected
+   component of p's territory? Each flood labels every cluster it touches. */
+static int annex_same_territory(Env *e, int p, int a, int b) {
+    if (e->cl_terr[a] && e->cl_terr[a] == e->cl_terr[b]) return 1;
+    if (e->cl_terr[a] && e->cl_terr[b]) return 0;
+
+    int start = e->cl_terr[b] == 0 ? b : a;
+    int id = e->cl_next_terr++;
+    e->cl_terr[start] = id;
+
+    e->ff_gen++;
+    if (e->ff_gen == 0) { memset(e->ff_visited, 0, sizeof(e->ff_visited)); e->ff_gen = 1; }
+
+    int s0 = e->cl_comp[e->cl_start[start]];
+    int sp = 0;
+    e->ff_visited[s0] = e->ff_gen;
+    e->ff_stack[sp++] = s0;
+    while (sp > 0) {
+        int t = e->ff_stack[--sp];
+        if (e->cl_visited[t] == e->cl_gen) e->cl_terr[e->cl_of[t]] = id;
+        int nb[8];
+        int k = neighbors8(t, nb);
+        for (int j = 0; j < k; j++) {
+            int u = nb[j];
+            if (e->ff_visited[u] == e->ff_gen || e->owner[u] != p) continue;
+            e->ff_visited[u] = e->ff_gen;
+            e->ff_stack[sp++] = u;
+        }
+    }
+    return e->cl_terr[a] == e->cl_terr[b];
+}
+
+static int annex_box_contains(Env *e, int j, int i) {
+    uint8_t *bj = e->cl_box[j], *bi = e->cl_box[i];
+    return bj[0] <= bi[0] && bj[1] <= bi[1] && bj[2] >= bi[2] && bj[3] >= bi[3];
+}
+
+/* cluster i is a hole: an inner rim of a territory whose outer perimeter
+   is another cluster j with a containing bbox */
+static int annex_is_hole(Env *e, int p, int i, int ncomp) {
+    for (int j = 0; j < ncomp; j++) {
+        if (j == i) continue;
+        if (annex_box_contains(e, j, i) && annex_same_territory(e, p, i, j))
+            return 1;
+    }
+    return 0;
+}
+
 static void annex_tick(Env *e, int p) {
     if (!e->players[p].alive) return;
     TileSet *b = &e->players[p].border;
@@ -1144,6 +1197,8 @@ static void annex_tick(Env *e, int p) {
         if (e->cl_visited[s] == e->cl_gen) continue;
 
         e->cl_start[ncomp] = ntot;
+        uint8_t *box = e->cl_box[ncomp];
+        box[0] = OF_W; box[1] = OF_H; box[2] = 0; box[3] = 0;
         int sp = 0;
         e->cl_visited[s] = e->cl_gen;
         e->cl_stack[sp++] = s;
@@ -1151,6 +1206,12 @@ static void annex_tick(Env *e, int p) {
         while (sp > 0) {
             int t = e->cl_stack[--sp];
             e->cl_comp[ntot++] = t;
+            e->cl_of[t] = ncomp;
+            int x = rx(t), y = ry(t);
+            if (x < box[0]) box[0] = (uint8_t)x;
+            if (y < box[1]) box[1] = (uint8_t)y;
+            if (x > box[2]) box[2] = (uint8_t)x;
+            if (y > box[3]) box[3] = (uint8_t)y;
             int nb[8];
             int k = neighbors8(t, nb);
             for (int j = 0; j < k; j++) {
@@ -1169,6 +1230,17 @@ static void annex_tick(Env *e, int p) {
     int largest = 0;
     for (int i = 1; i < ncomp; i++)
         if (e->cl_size[i] > e->cl_size[largest]) largest = i;
+
+    memset(e->cl_terr, 0, (size_t)ncomp * sizeof(e->cl_terr[0]));
+    e->cl_next_terr = 1;
+    if (ncomp > 1 && annex_is_hole(e, p, largest, ncomp)) {
+        int best = -1, best_len = -1;
+        for (int i = 0; i < ncomp; i++) {
+            if (i == largest || e->cl_size[i] <= best_len) continue;
+            if (!annex_is_hole(e, p, i, ncomp)) { best = i; best_len = e->cl_size[i]; }
+        }
+        if (best != -1) largest = best;
+    }
 
     if (annex_surrounded(e, p, &e->cl_comp[e->cl_start[largest]], e->cl_size[largest], 1))
         annex_remove(e, p, &e->cl_comp[e->cl_start[largest]], e->cl_size[largest]);
@@ -1752,6 +1824,35 @@ static unsigned long env_hash(Env *e) {
     return h;
 }
 
+static void annex_hole_test(void) {
+    Env *e = test_env(5);
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+
+    players_reset(e);
+    e->ticks = 100;
+    fill_rect(e, 1,  0,  0, 24, 48);
+    fill_rect(e, 2, 24,  0, 24, 48);
+    fill_rect(e, 3,  8,  8, 32, 32);
+    fill_rect(e, 4, 11, 11, 26,  1);
+    for (int x = 11; x <= 35; x += 2) fill_rect(e, 4, x, 11, 1, 25);
+    check_borders(e);
+    if (e->players[3].tiles.count != 686 || e->players[4].tiles.count != 338) {
+        printf("ANNEX HOLE SETUP BROKEN: P=%d Z=%d (expect 686/338)\n",
+               e->players[3].tiles.count, e->players[4].tiles.count);
+        exit(1);
+    }
+
+    annex_force(e, 3);
+    check_borders(e);
+    if (e->players[3].tiles.count != 686 || e->players[3].alive != 1) {
+        printf("ANNEX HOLE BROKEN: P tiles=%d alive=%d (expect 686/1)\n",
+               e->players[3].tiles.count, e->players[3].alive);
+        exit(1);
+    }
+    printf("annex hole ok\n");
+    free(e);
+}
+
 static void attack_logic_test(void) {
     static const struct {
         int ty; double atk_troops; int atk_is_bot, atk_tiles;
@@ -2126,6 +2227,7 @@ static void run_tests(void) {
     blob_test();
     heap_test();
     annex_test();
+    annex_hole_test();
     attack_test();
     attack_logic_test();
     isolation_test();
