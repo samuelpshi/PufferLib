@@ -248,6 +248,7 @@ struct Env {
     int    spawn_center[MAXP];
 
     double lt_sig[OF_N + 1];   /* lt_sigmoid(n), n = 0..OF_N; filled at init */
+    double cap_pow[OF_N + 1];  /* det_pow((double)n, 0.6), n = 0..OF_N; ditto */
 
     unsigned int cl_visited[OF_N];
     unsigned int cl_gen;
@@ -740,8 +741,18 @@ static void players_reset(Env *e) {
 
 // economy
 
+static inline double cap_pow(Env *e, int n) {
+#ifdef DEBUG
+    if (n < 0 || n > OF_N) {
+        printf("CAP_POW BROKEN: n = %d outside [0, %d]\n", n, OF_N);
+        exit(1);
+    }
+#endif
+    return e->cap_pow[n];
+}
+
 static double max_troops(Env *e, int p) {
-    double m = 2.0 * (det_pow((double)e->players[p].tiles.count, 0.6) * 1000.0 + 50000.0);
+    double m = 2.0 * (cap_pow(e, e->players[p].tiles.count) * 1000.0 + 50000.0);
     if (e->is_bot[p]) m /= 3.0;
     return m;
 }
@@ -1477,7 +1488,10 @@ static void sim_reset(Env *e) {
 /* n-only lookup tables. Called by sim_init and puf_init: the framework
    callocs Env and calls puf_init, never sim_init. */
 static void tables_init(Env *e) {
-    for (int n = 0; n <= OF_N; n++) e->lt_sig[n] = lt_sigmoid(n);
+    for (int n = 0; n <= OF_N; n++) {
+        e->lt_sig[n] = lt_sigmoid(n);
+        e->cap_pow[n] = det_pow((double)n, 0.6);
+    }
 }
 
 static void sim_init(Env *e, unsigned int seed) {
