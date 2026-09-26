@@ -106,15 +106,17 @@ typedef float obs_t;
 #include "pufferenv.h"
 
 #define ACT_NEIGHBORS 5
-#define ACT_SIZES {7}
+#define ACT_SIZES {13}   /* noop, TN, nb0..4, build_city, post_nb0..4 */
+#define ACT_BUILD_CITY 7
+#define ACT_POST0      8
 #define NUM_ATNS  1
-#define OBS_SIZE  31
+#define OBS_SIZE  39
 #ifdef __cplusplus
 #define OF_STATIC_ASSERT static_assert
 #else
 #define OF_STATIC_ASSERT _Static_assert
 #endif
-OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS, "OBS_SIZE out of sync");
+OF_STATIC_ASSERT(OBS_SIZE == 6 + 5*ACT_NEIGHBORS + 3 + ACT_NEIGHBORS, "OBS_SIZE out of sync");
 
 #define OF_W 48
 #define OF_H 48
@@ -193,6 +195,8 @@ typedef struct {
     int cities;        /* completed cities owned */
     long last_delete_tick;
     int delete_req;    /* slot a bot asked to scrap this tick; -1 = none */
+    int pend_type;     /* build issued last decision: 0 none, else type + 1 */
+    int pend_target;   /* post: target player id, fixed at issue */
 } Player;
 
 typedef struct {
@@ -236,6 +240,9 @@ struct Log {
     float eliminated;
     float rival_won;
     float timeout;
+    float cities_built;
+    float posts_built;
+    float build_noops;
     float n;
 };
 
@@ -245,6 +252,9 @@ typedef struct {
     int   prev_tiles;
     int   decisions;
     float episode_return;
+    int   cities_built;
+    int   posts_built;
+    int   build_noops;
 } Seat;
 
 typedef struct Env Env;
@@ -311,6 +321,10 @@ struct Env {
     Structure structs[MAXSTRUCT];
     int  struct_hw;             /* slots >= struct_hw are all dead */
     long struct_full_drops;
+
+    short          place_depth[OF_N];   /* build placement scratch */
+    unsigned short place_queue[OF_N];
+    unsigned short place_front[OF_N];
     int  heap_peak;
 };
 
@@ -781,6 +795,8 @@ static void players_reset(Env *e) {
         e->players[p].cities           = 0;
         e->players[p].last_delete_tick = -1;   /* PlayerImpl.ts:171 */
         e->players[p].delete_req       = -1;
+        e->players[p].pend_type        = 0;
+        e->players[p].pend_target      = 0;
     }
     memset(e->owner, 0, sizeof(e->owner));
     for (int i = 0; i < MAXSTRUCT; i++) e->structs[i].alive = 0;
@@ -834,6 +850,18 @@ static void structure_capture(Env *e, Structure *s, int q) {
     s->marked_at = -1;
 }
 
+/* structureMinDist (spec 15.5): any live structure of any owner, including
+   under construction, within d2 < STRUCT_MIN_DIST^2 blocks the tile. */
+static int can_place(Env *e, int tile) {
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (s->alive && tile_d2(s->tile, tile) < STRUCT_MIN_DIST * STRUCT_MIN_DIST) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* buildUnit on a resolved tile (spec 15.4). Returns 1 if built. Every refusal
    is a no-op: nothing is deducted. Placement search is the caller's job.
    Upstream creates the unit inside ConstructionExecution.tick, which runs
@@ -846,10 +874,7 @@ static int build_structure(Env *e, int p, int type, int tile) {
     if (!pl->alive || !is_land(e, tile) || e->owner[tile] != p) return 0;
     int64_t cost = structure_cost(e, p, type);
     if (pl->gold < cost) return 0;
-    for (int i = 0; i < e->struct_hw; i++)
-        if (e->structs[i].alive &&
-                tile_d2(e->structs[i].tile, tile) < STRUCT_MIN_DIST * STRUCT_MIN_DIST)
-            return 0;
+    if (!can_place(e, tile)) return 0;
     int slot = -1;
     for (int i = 0; i < MAXSTRUCT; i++)
         if (!e->structs[i].alive) { slot = i; break; }
@@ -916,6 +941,160 @@ static void structures_end_tick(Env *e) {
     }
 }
 
+// build placement (B-lite automatic placement; integer-only)
+
+OF_STATIC_ASSERT(OF_N <= 32767, "placement scratch stores tiles and depths in 16 bits");
+
+/* front(p, q): distinct tiles of p 4-adjacent to a tile of q, written to
+   place_front. Only border tiles can touch another owner. */
+static int front_tiles(Env *e, int p, int q) {
+    int n = 0;
+    TileSet *b = &e->players[p].border;
+    for (int i = 0; i < b->count; i++) {
+        int t = b->tiles[i], nb[4];
+        int k = neighbors(t, nb);
+        for (int j = 0; j < k; j++) {
+            if (e->owner[nb[j]] == q) {
+                e->place_front[n++] = (unsigned short)t;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
+/* Is tile t within post range (d2 <= 36) of any of the n front tiles? */
+static int covers_front(Env *e, int t, int n) {
+    for (int i = 0; i < n; i++) {
+        if (tile_d2(t, e->place_front[i]) <= POST_RANGE * POST_RANGE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+#define DEPTH_UNREACHED 32767
+
+/* Depth of each of p's tiles: multi-source BFS, 4-connected, over p's tiles.
+   Sources (depth 0) are p's tiles with an on-map 4-neighbour that is land
+   not owned by p: another player's or terra nullius. Water and the map edge
+   are not sources. Only border tiles can qualify, so scan the border set.
+   Tiles no source reaches keep DEPTH_UNREACHED: with zero sources every tile
+   ties there and the callers' lowest-index tie-break decides. */
+static void border_depth(Env *e, int p) {
+    TileSet *ts = &e->players[p].tiles, *b = &e->players[p].border;
+    for (int i = 0; i < ts->count; i++) {
+        e->place_depth[ts->tiles[i]] = DEPTH_UNREACHED;
+    }
+    int head = 0, tail = 0;
+    for (int i = 0; i < b->count; i++) {
+        int t = b->tiles[i], nb[4];
+        int k = neighbors(t, nb), src = 0;
+        for (int j = 0; j < k; j++) {
+            if (is_land(e, nb[j]) && e->owner[nb[j]] != p) {
+                src = 1;
+            }
+        }
+        if (!src) {
+            continue;
+        }
+        e->place_depth[t] = 0;
+        e->place_queue[tail++] = (unsigned short)t;
+    }
+    while (head < tail) {
+        int t = e->place_queue[head++], nb[4];
+        int k = neighbors(t, nb);
+        for (int j = 0; j < k; j++) {
+            int u = nb[j];
+            if (e->owner[u] != p || e->place_depth[u] != DEPTH_UNREACHED) {
+                continue;
+            }
+            e->place_depth[u] = (short)(e->place_depth[t] + 1);
+            e->place_queue[tail++] = (unsigned short)u;
+        }
+    }
+}
+
+/* City: the placeable own tile of greatest depth, lowest index on ties. */
+static int place_city(Env *e, int p) {
+    border_depth(e, p);
+    TileSet *ts = &e->players[p].tiles;
+    int best = -1;
+    for (int i = 0; i < ts->count; i++) {
+        int t = ts->tiles[i], d = e->place_depth[t];
+        if (best >= 0 && (d < e->place_depth[best] || (d == e->place_depth[best] && t > best))) {
+            continue;
+        }
+        if (can_place(e, t)) {
+            best = t;
+        }
+    }
+    return best;
+}
+
+/* Post toward q: among own tiles at depth >= 2 that are placeable and within
+   post range of the front, the one nearest the front centroid, compared as
+   key = (n x - Sx)^2 + (n y - Sy)^2 in int64; lowest index on ties. */
+static int place_post(Env *e, int p, int q) {
+    int n = front_tiles(e, p, q);
+    if (n == 0) {
+        return -1;
+    }
+    int64_t sx = 0, sy = 0;
+    for (int i = 0; i < n; i++) {
+        sx += rx(e->place_front[i]);
+        sy += ry(e->place_front[i]);
+    }
+    border_depth(e, p);
+    TileSet *ts = &e->players[p].tiles;
+    int best = -1;
+    int64_t best_key = 0;
+    for (int i = 0; i < ts->count; i++) {
+        int t = ts->tiles[i];
+        if (e->place_depth[t] < 2) {
+            continue;
+        }
+        int64_t dx = (int64_t)n * rx(t) - sx, dy = (int64_t)n * ry(t) - sy;
+        int64_t key = dx*dx + dy*dy;
+        if (best >= 0 && (key > best_key || (key == best_key && t > best))) {
+            continue;
+        }
+        if (can_place(e, t) && covers_front(e, t, n)) {
+            best = t;
+            best_key = key;
+        }
+    }
+    return best;
+}
+
+/* The agent's builds (spec 15.4): issued in apply_action on tick t, resolved
+   here at the end of t+1, after structures_end_tick, where upstream's
+   ConstructionExecution first ticks. Placement, then build_structure, whose
+   checks stay authoritative. Any failure is a noop with no gold spent. */
+static void builds_resolve(Env *e) {
+    for (int p = 1; p < MAXP; p++) {
+        Player *pl = &e->players[p];
+        if (pl->pend_type == 0) {
+            continue;
+        }
+        int type = pl->pend_type - 1;
+        pl->pend_type = 0;
+        int tile = type == STRUCT_CITY ? place_city(e, p) : place_post(e, p, pl->pend_target);
+        int built = tile >= 0 && build_structure(e, p, type, tile);
+        if (p > e->num_agents) {
+            continue;
+        }
+        Seat *st = &e->seats[p - 1];
+        if (!built) {
+            st->build_noops++;
+        } else if (type == STRUCT_CITY) {
+            st->cities_built++;
+        } else {
+            st->posts_built++;
+        }
+    }
+}
+
 /* Death (spec 6.1 step 3) deletes every structure p still owns. Unreachable
    through the sim: p owning a structure's tile means p is alive, so the
    capture pass has already moved or deleted everything. Kept for fidelity. */
@@ -925,13 +1104,14 @@ static void structures_delete_all(Env *e, int p) {
             structure_delete(e, &e->structs[i]);
 }
 
-/* hasUnitNearby(tile, range, DefensePost, defender): completed posts only,
-   Euclidean inclusive (spec 2.4, 17.1). */
-static int defended_by_post(Env *e, int defender, int t) {
-    if (defender == 0 || e->players[defender].n_struct == 0) return 0;
+/* hasUnitNearby(tile, range, DefensePost, owner): does owner have a completed
+   post within d2 <= POST_RANGE^2 (inclusive) of tile t (spec 2.4, 17.1)? The
+   one test for both combat (the has_post argument) and the obs flag. */
+static int post_covers(Env *e, int owner, int t) {
+    if (owner == 0 || e->players[owner].n_struct == 0) return 0;
     for (int i = 0; i < e->struct_hw; i++) {
         Structure *s = &e->structs[i];
-        if (!s->alive || s->owner != defender || s->type != STRUCT_POST) continue;
+        if (!s->alive || s->owner != owner || s->type != STRUCT_POST) continue;
         if (s->build_left == 0 && tile_d2(s->tile, t) <= POST_RANGE * POST_RANGE)
             return 1;
     }
@@ -1226,7 +1406,7 @@ static void attack_tick(Env *e, Attack *a) {
                                    tp != 0, tp ? e->is_bot[tp] : 0,
                                    def_n, lt_sig(e, def_n),
                                    tp ? (double)e->players[tp].troops : 0.0,
-                                   defended_by_post(e, tp, t), bs);
+                                   post_covers(e, tp, t), bs);
         tick_budget -= r.frac;
         a->troops -= r.atk_loss;
         if (a->troops < 0.0) a->troops = 0.0;
@@ -1780,6 +1960,7 @@ static int sim_tick(Env *e) {
         if (e->attacks[i].active) attack_tick(e, &e->attacks[i]);
     for (int p = 1; p < MAXP; p++) { player_tick(e, p); annex_tick(e, p); }
     structures_end_tick(e);
+    builds_resolve(e);
     if (e->ticks % 50 == 0) check_borders(e);
     if (e->ticks % 10 == 0) return win_check(e);
     return 0;
@@ -2914,12 +3095,12 @@ static void structure_test(void) {
     const long BP = e->ticks;
     struct_expect("range post", build_structure(e, 2, STRUCT_POST, post), 1);
     while (e->ticks < BP + POST_BUILD_TICKS) struct_tick(e);
-    struct_expect("B+50: not complete", defended_by_post(e, 2, ref(24, 20)), 0);
+    struct_expect("B+50: not complete", post_covers(e, 2, ref(24, 20)), 0);
     struct_tick(e);
     struct_expect("B+51: complete", e->structs[struct_at(e, post)].build_left, 0);
-    struct_expect("d2=36", defended_by_post(e, 2, ref(24, 20)), 1);
-    struct_expect("d2=37", defended_by_post(e, 2, ref(24, 21)), 0);
-    struct_expect("not p1's post", defended_by_post(e, 1, ref(24, 20)), 0);
+    struct_expect("d2=36", post_covers(e, 2, ref(24, 20)), 1);
+    struct_expect("d2=37", post_covers(e, 2, ref(24, 21)), 0);
+    struct_expect("not p1's post", post_covers(e, 1, ref(24, 20)), 0);
     /* Through attack_tick: the same attack, with and without the post. The
        whole front (x = 15, y = 15..25) is within range of (18, 20). */
     Env *e2 = (Env*)malloc(sizeof(Env));
@@ -3056,23 +3237,6 @@ static void structure_test(void) {
     free(e);
 }
 
-static void run_tests(void) {
-    ts_test();
-    conquer_test();
-    blob_test();
-    heap_test();
-    annex_test();
-    annex_hole_test();
-    attack_test();
-    attack_logic_test();
-    isolation_test();
-    map_test();
-    annex_shore_test();
-    gold_test();
-    structure_test();
-}
-#else
-static void run_tests(void) {}
 #endif
 
 // observations
@@ -3153,6 +3317,31 @@ static void compute_observations(Env *e) {
                 }
             }
         }
+
+        double gold = (double)e->players[p].gold;
+        obs[idx++] = within((float)(gold / (double)structure_cost(e, p, STRUCT_CITY)), 0.0f, 1.0f);
+        obs[idx++] = within((float)(gold / (double)structure_cost(e, p, STRUCT_POST)), 0.0f, 1.0f);
+        int cities = e->players[p].cities < 4 ? e->players[p].cities : 4;
+        obs[idx++] = (float)cities / 4.0f;
+
+        /* Per slot: q's side of the shared front (G, q's tiles 4-adjacent to
+           ours) has a tile that q's completed post covers, as combat
+           measures it. Only border tiles can touch another owner. */
+        for (int k = 0; k < ACT_NEIGHBORS; k++) {
+            int q = k < n_nb ? nb_p[k] : 0, flag = 0;
+            TileSet *qb = &e->players[q].border;
+            for (int i = 0; q != 0 && !flag && i < qb->count; i++) {
+                int g = qb->tiles[i], nb[4];
+                int n = neighbors(g, nb), touches = 0;
+                for (int j = 0; j < n; j++) {
+                    if (e->owner[nb[j]] == p) {
+                        touches = 1;
+                    }
+                }
+                flag = touches && post_covers(e, q, g);
+            }
+            obs[idx++] = flag ? 1.0f : 0.0f;
+        }
     }
 }
 
@@ -3167,6 +3356,31 @@ static void apply_action(Env *e, int seat_idx) {
 
     int action = (int)e->agents[seat_idx].actions[0];
     if (action <= 0) return;
+
+    /* Builds are only recorded here; builds_resolve acts on them at the end
+       of the next tick. A post stores the neighbour's player id, not K. */
+    if (action >= ACT_BUILD_CITY) {
+#ifdef DEBUG
+        if (e->players[p].pend_type != 0) {
+            printf("BUILD BROKEN: p%d issued with a build still pending\n", p);
+            exit(1);
+        }
+#endif
+        if (action == ACT_BUILD_CITY) {
+            e->players[p].pend_type = STRUCT_CITY + 1;
+            return;
+        }
+        int nb_p[MAXP], nb_shared[MAXP];
+        int n_nb = sorted_neighbors(e, p, nb_p, nb_shared);
+        int k = action - ACT_POST0;
+        if (k >= n_nb) {
+            s->build_noops++;
+            return;
+        }
+        e->players[p].pend_type = STRUCT_POST + 1;
+        e->players[p].pend_target = nb_p[k];
+        return;
+    }
 
     double send = (double)e->players[p].troops / 5.0;
     if (send < 1.0) return;
@@ -3196,6 +3410,9 @@ static void add_log(Env *e, int seat_idx, int winner) {
     e->log.episode_length += s->decisions;
     e->log.win            += ((float)tiles / e->land_tiles > 0.8f);
     e->log.annexations    += e->annex_by[p];
+    e->log.cities_built   += (float)s->cities_built;
+    e->log.posts_built    += (float)s->posts_built;
+    e->log.build_noops    += (float)s->build_noops;
 
     if      (tiles == 0)  e->log.eliminated += 1.0f;
     else if (winner == p) e->log.won        += 1.0f;
@@ -3217,6 +3434,9 @@ void puf_reset(Env *e) {
         e->seats[a].prev_tiles      = e->players[p].tiles.count;
         e->seats[a].decisions       = 0;
         e->seats[a].episode_return  = 0.0f;
+        e->seats[a].cities_built    = 0;
+        e->seats[a].posts_built     = 0;
+        e->seats[a].build_noops     = 0;
     }
     e->steps = 0;
     e->annex_events = 0;
@@ -3331,10 +3551,351 @@ void puf_log(Log *log, Dict *out) {
     dict_set(out, "eliminated",     log->eliminated);
     dict_set(out, "rival_won",      log->rival_won);
     dict_set(out, "timeout",        log->timeout);
+    dict_set(out, "cities_built",   log->cities_built);
+    dict_set(out, "posts_built",    log->posts_built);
+    dict_set(out, "build_noops",    log->build_noops);
     dict_set(out, "n",              log->n);
 }
 
 void puf_close(Env *e) {
     (void)e;
 }
+
+// binding tests and the test runner (debug builds only)
+
+#ifdef DEBUG
+static obs_t bt_obs[OBS_SIZE];
+static float bt_act[NUM_ATNS], bt_rew[1], bt_term[1];
+
+/* Seat 0 is agent p1 (human). No bot ever decides. */
+static void build_seat(Env *e) {
+    e->num_agents = 1;
+    e->max_steps = 200;
+    e->action_repeat = 10;
+    e->agents[0].observations = bt_obs;
+    e->agents[0].actions = bt_act;
+    e->agents[0].rewards = bt_rew;
+    e->agents[0].terminals = bt_term;
+    memset(&e->seats[0], 0, sizeof(Seat));
+    e->seats[0].seat = 1;
+    e->is_bot[1] = 0;
+    troops_set(e, 1, 25000.0);
+    for (int p = 1; p < MAXP; p++) {
+        e->bots[p].attack_rate = 1000000;
+        e->bots[p].attack_off = 999999;
+    }
+}
+
+/* Water everywhere but the land rectangles given; resets players. */
+static void build_land(Env *e, const int (*r)[4], int n) {
+    memset(e->terrain, OF_OCEAN_BIT | 1, sizeof(e->terrain));
+    e->land_tiles = 0;
+    for (int i = 0; i < n; i++) {
+        for (int y = r[i][1]; y < r[i][1] + r[i][3]; y++) {
+            for (int x = r[i][0]; x < r[i][0] + r[i][2]; x++) {
+                e->terrain[ref(x, y)] = OF_LAND_BIT | 5;
+                e->land_tiles++;
+            }
+        }
+    }
+    players_reset(e);
+    bots_init(e);
+    for (int i = 0; i < MAXATK; i++) {
+        e->attacks[i].active = 0;
+    }
+    e->ticks = 100;
+}
+
+/* The standard world: a 30x20 land block in water; p1 owns x 5..19, bot p2
+   owns x 20..34. p1's only depth sources are x = 19, so depth = 19 - x. */
+static void build_world(Env *e) {
+    const int r[1][4] = {{5, 5, 30, 20}};
+    build_land(e, r, 1);
+    fill_rect(e, 1, 5, 5, 15, 20);
+    fill_rect(e, 2, 20, 5, 15, 20);
+    build_seat(e);
+}
+
+static void build_issue(Env *e, int action) {
+    bt_act[0] = (float)action;
+    apply_action(e, 0);
+}
+
+static void build_test(void) {
+    Env *e = test_env(8);
+    Player *pl = e->players;
+    Seat *st = &e->seats[0];
+
+    /* a. City issued on t: nothing at t; created and paid on t+1 (after
+       that tick's income); complete on t+22, not t+21. Deepest tile is x = 5,
+       lowest index (5, 5). */
+    build_world(e);
+    pl[1].gold = 200000;
+    long t = e->ticks;
+    build_issue(e, ACT_BUILD_CITY);
+    struct_expect("a: pending", pl[1].pend_type, STRUCT_CITY + 1);
+    struct_expect("a: t gold", pl[1].gold, 200000);
+    struct_expect("a: t structures", pl[1].n_struct, 0);
+    sim_tick(e);
+    struct_expect("a: t+1 structures", pl[1].n_struct, 1);
+    struct_expect("a: t+1 tile", struct_at(e, ref(5, 5)) >= 0, 1);
+    struct_expect("a: t+1 gold", pl[1].gold, 200000 + 1000 - 125000);
+    struct_expect("a: t+1 pending cleared", pl[1].pend_type, 0);
+    struct_expect("a: cities_built", st->cities_built, 1);
+    while (e->ticks < t + 21) {
+        sim_tick(e);
+    }
+    struct_expect("a: t+21 not complete", pl[1].cities, 0);
+    sim_tick(e);
+    struct_expect("a: t+22 complete", pl[1].cities, 1);
+    struct_expect("a: t+22 one structure", pl[1].n_struct, 1);
+
+    /* b. Post toward p2, issued on t, complete on t+52. Front x = 19,
+       y 5..24: n 20, Sx 380, Sy 290. Depth >= 2 means x <= 17; the key ties
+       at (17,14) and (17,15), and the lower index wins. */
+    pl[1].gold = 200000;
+    t = e->ticks;
+    build_issue(e, ACT_POST0);
+    struct_expect("b: pending target", pl[1].pend_target, 2);
+    sim_tick(e);
+    int bp = struct_at(e, ref(17, 14));
+    struct_expect("b: t+1 tile", bp >= 0, 1);
+    struct_expect("b: t+1 type", e->structs[bp].type, STRUCT_POST);
+    struct_expect("b: posts_built", st->posts_built, 1);
+    while (e->ticks < t + 51) {
+        sim_tick(e);
+    }
+    struct_expect("b: t+51 not complete", e->structs[bp].build_left, 1);
+    sim_tick(e);
+    struct_expect("b: t+52 complete", e->structs[bp].build_left, 0);
+
+    /* c. A second City after the first completes: d2 >= 9 from it, at the max
+       depth among unblocked tiles, lowest index: (5, 8). */
+    pl[1].gold = 300000;
+    build_issue(e, ACT_BUILD_CITY);
+    sim_tick(e);
+    int c2 = struct_at(e, ref(5, 8));
+    struct_expect("c: tile", c2 >= 0, 1);
+    struct_expect("c: d2 from first", tile_d2(ref(5, 8), ref(5, 5)) >= 9, 1);
+    border_depth(e, 1);
+    int maxd = -1;
+    for (int i = 0; i < pl[1].tiles.count; i++) {
+        int u = pl[1].tiles.tiles[i];
+        if (u != ref(5, 8) && can_place(e, u) && e->place_depth[u] > maxd) {
+            maxd = e->place_depth[u];
+        }
+    }
+    struct_expect("c: max depth", e->place_depth[ref(5, 8)] >= maxd, 1);
+    struct_expect("c: depth 14", e->place_depth[ref(5, 8)], 14);
+
+    /* d. Unaffordable at resolution: noop, no gold spent (income only). */
+    pl[1].gold = 0;
+    int n_before = pl[1].n_struct, noops = st->build_noops;
+    build_issue(e, ACT_BUILD_CITY);
+    sim_tick(e);
+    struct_expect("d: gold", pl[1].gold, 1000);
+    struct_expect("d: no structure", pl[1].n_struct, n_before);
+    struct_expect("d: build_noops", st->build_noops, noops + 1);
+
+    /* e. The neighbour stops bordering between issue and resolution. Then a
+       post slot past the neighbour count is a noop at issue. */
+    pl[1].gold = 1000000;
+    build_issue(e, ACT_POST0);
+    fill_rect(e, 3, 20, 5, 15, 20);
+    struct_expect("e: p2 gone", pl[2].alive, 0);
+    n_before = pl[1].n_struct;
+    noops = st->build_noops;
+    sim_tick(e);
+    struct_expect("e: no structure", pl[1].n_struct, n_before);
+    struct_expect("e: build_noops", st->build_noops, noops + 1);
+    build_issue(e, ACT_POST0 + 3);
+    struct_expect("e: K >= count, no pending", pl[1].pend_type, 0);
+    struct_expect("e: K >= count, build_noops", st->build_noops, noops + 2);
+
+    /* f. Thin territory: a 2-wide strip on the front (depths 0 and 1) plus a
+       far island no source reaches (depth DEPTH_UNREACHED, but out of post
+       range of the front). No candidate: noop, no gold spent. */
+    const int thin[3][4] = {{18, 5, 2, 20}, {20, 5, 15, 20}, {1, 30, 6, 11}};
+    build_land(e, thin, 3);
+    fill_rect(e, 1, 18, 5, 2, 20);
+    fill_rect(e, 1, 1, 30, 6, 11);
+    fill_rect(e, 2, 20, 5, 15, 20);
+    build_seat(e);
+    pl[1].gold = 1000000;
+    struct_expect("f: place_post", place_post(e, 1, 2), -1);
+    struct_expect("f: island unreached", e->place_depth[ref(3, 35)], DEPTH_UNREACHED);
+    build_issue(e, ACT_POST0);
+    sim_tick(e);
+    struct_expect("f: no structure", pl[1].n_struct, 0);
+    struct_expect("f: gold", pl[1].gold, 1000000 + 1000);
+    struct_expect("f: build_noops", st->build_noops, 1);
+
+    /* f2. Placement coverage is inclusive at d2 = 36. p1 is a 1-wide strip
+       at x = 19 (y 10..14) between p3 and p2, so every strip tile is a
+       source (depth 0); its only candidates are on a water-isolated island
+       (unreached). The island tile (19, 20) is exactly 6 below the front
+       end (19, 14); every other island tile is farther. */
+    const int cov[4][4] = {{5, 10, 14, 5}, {19, 10, 1, 5}, {20, 10, 15, 5}, {17, 20, 5, 3}};
+    build_land(e, cov, 4);
+    fill_rect(e, 3, 5, 10, 14, 5);
+    fill_rect(e, 1, 19, 10, 1, 5);
+    fill_rect(e, 2, 20, 10, 15, 5);
+    fill_rect(e, 1, 17, 20, 5, 3);
+    build_seat(e);
+    struct_expect("f2: island tile at d2 36", place_post(e, 1, 2), ref(19, 20));
+    struct_expect("f2: strip is depth 0", e->place_depth[ref(19, 12)], 0);
+
+    /* g. Slots reshuffle between issue and resolution: the post still
+       targets the player id stored at issue. */
+    const int blk[1][4] = {{5, 5, 30, 20}};
+    build_land(e, blk, 1);
+    fill_rect(e, 1, 5, 5, 15, 20);
+    fill_rect(e, 2, 20, 5, 15, 12);
+    fill_rect(e, 3, 20, 17, 15, 8);
+    build_seat(e);
+    pl[1].gold = 1000000;
+    int nb_p[MAXP], nb_s[MAXP];
+    sorted_neighbors(e, 1, nb_p, nb_s);
+    struct_expect("g: nb1 is p3 at issue", nb_p[1], 3);
+    build_issue(e, ACT_POST0 + 1);
+    fill_rect(e, 3, 20, 13, 15, 4);
+    sorted_neighbors(e, 1, nb_p, nb_s);
+    struct_expect("g: nb0 is p3 at resolution", nb_p[0], 3);
+    int want = place_post(e, 1, 3);
+    struct_expect("g: p2 would differ", place_post(e, 1, 2) != want, 1);
+    sim_tick(e);
+    int gp = struct_at(e, want);
+    struct_expect("g: placed toward p3", gp >= 0, 1);
+    struct_expect("g: post", e->structs[gp].type, STRUCT_POST);
+
+    /* h. Obs: gold ratios, city count, and the neighbour-post flag (slot 0 is
+       p2). The flag is measured against G = p2's front tiles (x = 20), as in
+       combat; our front F is x = 19. */
+    build_world(e);
+    pl[1].gold = 62500;
+    pl[2].gold = 1000000;
+    struct_expect("h: far post", build_structure(e, 2, STRUCT_POST, ref(27, 10)), 1);
+    for (int k = 0; k <= POST_BUILD_TICKS; k++) {
+        structures_end_tick(e);
+    }
+    compute_observations(e);
+    struct_expect_near("h: gold/city", bt_obs[31], 0.5);
+    struct_expect_near("h: gold/post", bt_obs[32], 1.0);
+    struct_expect_near("h: cities", bt_obs[33], 0.0);
+    struct_expect_near("h: out of range (d2 to G 49)", bt_obs[34], 0.0);
+    /* Geometry (1): d2 36 to G tile (20,14), 49 to F tile (19,14). */
+    struct_expect("h: near post", build_structure(e, 2, STRUCT_POST, ref(26, 14)), 1);
+    compute_observations(e);
+    struct_expect_near("h: under construction", bt_obs[34], 0.0);
+    for (int k = 0; k <= POST_BUILD_TICKS; k++) {
+        structures_end_tick(e);
+    }
+    compute_observations(e);
+    struct_expect_near("h: covers G, not F", bt_obs[34], 1.0);
+    struct_expect("h: combat agrees", post_covers(e, 2, ref(20, 14)), 1);
+    struct_expect_near("h: empty slot", bt_obs[35], 0.0);
+    /* Geometry (2): p2's post on a one-tile island in a pond inside p1's
+       territory, at (13, 20). d2 36 to F tile (19, 20), >= 49 to every G
+       tile: flag 0. */
+    const int pond[1][4] = {{5, 5, 30, 20}};
+    build_land(e, pond, 1);
+    for (int y = 18; y <= 22; y++) {
+        for (int x = 11; x <= 15; x++) {
+            if (x != 13 || y != 20) {
+                e->terrain[ref(x, y)] = OF_OCEAN_BIT | 1;
+            }
+        }
+    }
+    for (int y = 5; y < 25; y++) {
+        for (int x = 5; x < 20; x++) {
+            if (is_land(e, ref(x, y)) && (x != 13 || y != 20)) {
+                conquer(e, 1, ref(x, y));
+            }
+        }
+    }
+    fill_rect(e, 2, 20, 5, 15, 20);
+    conquer(e, 2, ref(13, 20));
+    build_seat(e);
+    pl[2].gold = 1000000;
+    struct_expect("h2: island post", build_structure(e, 2, STRUCT_POST, ref(13, 20)), 1);
+    for (int k = 0; k <= POST_BUILD_TICKS; k++) {
+        structures_end_tick(e);
+    }
+    check_borders(e);
+    struct_expect("h2: covers an F tile", tile_d2(ref(13, 20), ref(19, 20)), 36);
+    compute_observations(e);
+    struct_expect_near("h2: covers F, not G", bt_obs[34], 0.0);
+
+    /* i. Placement is deterministic: same answer from a copy and on repeat. */
+    Env *e2 = (Env*)malloc(sizeof(Env));
+    if (!e2) {
+        printf("build_test: oom\n");
+        exit(1);
+    }
+    memcpy(e2, e, sizeof(Env));
+    int pc = place_city(e, 1), pp = place_post(e, 1, 2);
+    struct_expect("i: city copy", place_city(e2, 1), pc);
+    struct_expect("i: post copy", place_post(e2, 1, 2), pp);
+    struct_expect("i: city repeat", place_city(e, 1), pc);
+    struct_expect("i: post repeat", place_post(e, 1, 2), pp);
+    free(e2);
+
+    /* j. A build issued on an episode's final decision resolves inside that
+       step (first tick), is logged, and nothing is pending after the reset. */
+    e->land_frac = 0.65f;
+    e->agent_is_bot = 0;
+    build_seat(e);
+    e->max_steps = 3;
+    memset(&e->log, 0, sizeof(Log));
+    puf_reset(e);
+    bt_act[0] = 0.0f;
+    puf_step(e);
+    puf_step(e);
+    bt_act[0] = (float)ACT_BUILD_CITY;
+    puf_step(e);
+    struct_expect("j: reset happened", e->steps, 0);
+    struct_expect_near("j: logged", e->log.cities_built + e->log.build_noops, 1.0);
+    for (int p = 0; p < MAXP; p++) {
+        struct_expect("j: pend_type", pl[p].pend_type, 0);
+        struct_expect("j: pend_target", pl[p].pend_target, 0);
+    }
+    pl[1].pend_type = STRUCT_POST + 1;
+    pl[1].pend_target = 3;
+    puf_reset(e);
+    struct_expect("j: reset clears pend_type", pl[1].pend_type, 0);
+    struct_expect("j: reset clears pend_target", pl[1].pend_target, 0);
+
+    /* k. No land-adjacent foreign tile: every depth ties, lowest index wins. */
+    const int isl[1][4] = {{10, 10, 5, 5}};
+    build_land(e, isl, 1);
+    fill_rect(e, 1, 10, 10, 5, 5);
+    build_seat(e);
+    pl[1].gold = 1000000;
+    struct_expect("k: first", place_city(e, 1), ref(10, 10));
+    struct_expect("k: build", build_structure(e, 1, STRUCT_CITY, ref(10, 10)), 1);
+    struct_expect("k: next unblocked", place_city(e, 1), ref(13, 10));
+
+    printf("builds ok: issue/resolve timing, placement, noops, reshuffle, obs, reset\n");
+    free(e);
+}
+
+static void run_tests(void) {
+    ts_test();
+    conquer_test();
+    blob_test();
+    heap_test();
+    annex_test();
+    annex_hole_test();
+    attack_test();
+    attack_logic_test();
+    isolation_test();
+    map_test();
+    annex_shore_test();
+    gold_test();
+    structure_test();
+    build_test();
+}
+#else
+static void run_tests(void) {}
+#endif
 #pragma STDC FP_CONTRACT DEFAULT
