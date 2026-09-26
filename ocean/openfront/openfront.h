@@ -3510,6 +3510,17 @@ void puf_render(Env *e) {
         else                         c = PAL[e->owner[t]];
         DrawRectangle(rx(t)*CELL, ry(t)*CELL, CELL, CELL, c);
     }
+    static const Color CITY_C = {255, 255, 255, 255};
+    static const Color POST_C = {10, 10, 10, 255};
+    for (int i = 0; i < e->struct_hw; i++) {
+        const Structure *s = &e->structs[i];
+        if (!s->alive) continue;
+        int x = rx(s->tile)*CELL, y = ry(s->tile)*CELL;
+        DrawRectangle(x + 3, y + 3, CELL - 6, CELL - 6,
+                      s->type == STRUCT_CITY ? CITY_C : POST_C);
+        if (s->build_left > 0)   /* under construction: hollow */
+            DrawRectangle(x + 5, y + 5, CELL - 10, CELL - 10, PAL[s->owner]);
+    }
     EndDrawing();
 }
 
