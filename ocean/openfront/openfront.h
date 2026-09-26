@@ -142,6 +142,19 @@ OF_STATIC_ASSERT(OF_W <= 255 && OF_H <= 255, "cl_box stores coordinates as uint8
 #define GOLD_BASE_HUMAN 100.0
 #define GOLD_BASE_BOT   50.0
 
+/* Structures (spec 15-17). City and DefensePost only (Tier B-lite). */
+#define MAXSTRUCT        256
+#define STRUCT_CITY      0
+#define STRUCT_POST      1
+#define STRUCT_TYPES     2
+#define CITY_BUILD_TICKS 20
+#define POST_BUILD_TICKS 50
+#define CITY_TROOP_BONUS 25000.0   /* rescale: upstream 250k, reference §4 */
+#define POST_RANGE       6         /* rescale: upstream 30 */
+#define STRUCT_MIN_DIST  3         /* rescale: upstream 15 */
+#define DELETE_COOLDOWN  300
+#define DELETE_MARK_TICKS 300
+
 /* Config.attackLogic constants (spec 9) */
 #define LT_MIDPOINT            300000.0
 #define LT_STEEPNESS           2.5
@@ -175,7 +188,21 @@ typedef struct {
     int64_t gold;
     int alive;
     int sent_attack;   /* upstream ATTACK_INDEX_SENT != 0; see attack_start */
+    int units_constructed[STRUCT_TYPES];   /* lifetime build starts */
+    int n_struct;      /* live structures owned, any type or state */
+    int cities;        /* completed cities owned */
+    long last_delete_tick;
+    int delete_req;    /* slot a bot asked to scrap this tick; -1 = none */
 } Player;
+
+typedef struct {
+    int  type;         /* STRUCT_CITY | STRUCT_POST */
+    int  owner;
+    int  tile;
+    int  build_left;   /* end-of-tick passes left; 0 = complete */
+    long marked_at;    /* tick marked for deletion; -1 = unmarked */
+    int  alive;
+} Structure;
 
 typedef struct {
     int   active;
@@ -280,6 +307,10 @@ struct Env {
     long annex_tiles_moved;
     long spawn_failures;
     long heap_full_drops;
+
+    Structure structs[MAXSTRUCT];
+    int  struct_hw;             /* slots >= struct_hw are all dead */
+    long struct_full_drops;
     int  heap_peak;
 };
 
@@ -744,8 +775,167 @@ static void players_reset(Env *e) {
         e->is_bot[p]         = 1;
         e->last_calc[p]        = (long)(p * 7 % ANNEX_PERIOD);
         e->last_tile_change[p] = 0;
+        for (int k = 0; k < STRUCT_TYPES; k++)
+            e->players[p].units_constructed[k] = 0;
+        e->players[p].n_struct         = 0;
+        e->players[p].cities           = 0;
+        e->players[p].last_delete_tick = -1;   /* PlayerImpl.ts:171 */
+        e->players[p].delete_req       = -1;
     }
     memset(e->owner, 0, sizeof(e->owner));
+    for (int i = 0; i < MAXSTRUCT; i++) e->structs[i].alive = 0;
+    e->struct_hw = 0;
+}
+
+// structures (spec 15-17)
+
+static int tile_d2(int a, int b) {
+    int dx = rx(a) - rx(b), dy = ry(a) - ry(b);
+    return dx*dx + dy*dy;
+}
+
+/* costWrapper (spec 15.3): n = min(unitsOwned, unitsConstructed), where
+   unitsOwned counts an under-construction structure as 1 (no levels here). */
+static int64_t structure_cost(Env *e, int p, int type) {
+    int owned = 0;
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (s->alive && s->owner == p && s->type == type) owned++;
+    }
+    int built = e->players[p].units_constructed[type];
+    int n = owned < built ? owned : built;
+    double c = type == STRUCT_CITY ? fmin(1e6, det_pow2(n) * 125000.0)
+                                   : fmin(250000.0, (double)(n + 1) * 50000.0);
+    int64_t ci = (int64_t)c;
+#ifdef DEBUG
+    if ((double)ci != c) {
+        printf("COST BROKEN: type %d n %d cost %.17g not an integer\n", type, n, c);
+        exit(1);
+    }
+#endif
+    return ci;
+}
+
+static void structure_delete(Env *e, Structure *s) {
+    Player *o = &e->players[s->owner];
+    if (s->type == STRUCT_CITY && s->build_left == 0) o->cities--;
+    o->n_struct--;
+    s->alive = 0;
+    while (e->struct_hw > 0 && !e->structs[e->struct_hw - 1].alive) e->struct_hw--;
+}
+
+/* captureUnit: ownership moves, the build timer is kept, the mark is cleared. */
+static void structure_capture(Env *e, Structure *s, int q) {
+    Player *o = &e->players[s->owner], *n = &e->players[q];
+    o->n_struct--;
+    n->n_struct++;
+    if (s->type == STRUCT_CITY && s->build_left == 0) { o->cities--; n->cities++; }
+    s->owner = q;
+    s->marked_at = -1;
+}
+
+/* buildUnit on a resolved tile (spec 15.4). Returns 1 if built. Every refusal
+   is a no-op: nothing is deducted. Placement search is the caller's job.
+   Upstream creates the unit inside ConstructionExecution.tick, which runs
+   after the player executions, so call this from the end-of-tick pass, after
+   structures_end_tick. build_left = D + 1: ConstructionExecution.ts:91 checks
+   for 0 before decrementing (:97), so completion lands D + 1 ticks after
+   the creation tick. */
+static int build_structure(Env *e, int p, int type, int tile) {
+    Player *pl = &e->players[p];
+    if (!pl->alive || !is_land(e, tile) || e->owner[tile] != p) return 0;
+    int64_t cost = structure_cost(e, p, type);
+    if (pl->gold < cost) return 0;
+    for (int i = 0; i < e->struct_hw; i++)
+        if (e->structs[i].alive &&
+                tile_d2(e->structs[i].tile, tile) < STRUCT_MIN_DIST * STRUCT_MIN_DIST)
+            return 0;
+    int slot = -1;
+    for (int i = 0; i < MAXSTRUCT; i++)
+        if (!e->structs[i].alive) { slot = i; break; }
+    if (slot < 0) { e->struct_full_drops++; return 0; }
+
+    pl->gold -= cost;
+    pl->units_constructed[type]++;
+    pl->n_struct++;
+    Structure *s = &e->structs[slot];
+    s->type = type;
+    s->owner = p;
+    s->tile = tile;
+    s->build_left = (type == STRUCT_CITY ? CITY_BUILD_TICKS : POST_BUILD_TICKS) + 1;
+    s->marked_at = -1;
+    s->alive = 1;
+    if (slot >= e->struct_hw) e->struct_hw = slot + 1;
+    return 1;
+}
+
+/* PlayerExecution step 2 (capture, spec 6.1 / 15.7) over p's structures. */
+static void structures_tick(Env *e, int p) {
+    if (e->players[p].n_struct == 0) return;
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (!s->alive || s->owner != p) continue;
+        int o = e->owner[s->tile];
+        if (o == 0) { structure_delete(e, s); continue; }
+        if (o == p) continue;
+        if (s->type == STRUCT_POST) structure_delete(e, s);
+        else structure_capture(e, s, o);
+    }
+}
+
+/* The executions upstream adds after the player executions, run after
+   sim_tick's player loop, in upstream order:
+   - ConstructionExecution.tick: countdown; complete when it reaches 0.
+   - DeleteUnitExecution.tick: delete when ticks - deletionAt > 0, with
+     deletionAt = mark + 300 (UnitImpl.ts:313, :322), i.e. at mark + 301.
+   - DeleteUnitExecution.init, end of tick (GameImpl.ts:501): a bot's request
+     from bot_delete_next is refused, with no cooldown spent, unless the
+     structure is still live, the bot's, on the bot's tile, and the cooldown
+     has elapsed (DeleteUnitExecution.ts:24-66). Slots are only reused by
+     build_structure, which runs after this, so a live slot here is still the
+     structure that was requested. */
+static void structures_end_tick(Env *e) {
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (!s->alive) continue;
+        if (s->build_left > 0 && --s->build_left == 0 && s->type == STRUCT_CITY)
+            e->players[s->owner].cities++;
+        if (s->marked_at >= 0 && e->ticks - (s->marked_at + DELETE_MARK_TICKS) > 0)
+            structure_delete(e, s);
+    }
+    for (int p = 1; p < MAXP; p++) {
+        Player *pl = &e->players[p];
+        int i = pl->delete_req;
+        if (i < 0) continue;
+        pl->delete_req = -1;
+        Structure *s = &e->structs[i];
+        if (!s->alive || s->owner != p || e->owner[s->tile] != p) continue;
+        if (e->ticks - pl->last_delete_tick < DELETE_COOLDOWN) continue;
+        pl->last_delete_tick = e->ticks;
+        s->marked_at = e->ticks;
+    }
+}
+
+/* Death (spec 6.1 step 3) deletes every structure p still owns. Unreachable
+   through the sim: p owning a structure's tile means p is alive, so the
+   capture pass has already moved or deleted everything. Kept for fidelity. */
+static void structures_delete_all(Env *e, int p) {
+    for (int i = 0; i < e->struct_hw; i++)
+        if (e->structs[i].alive && e->structs[i].owner == p)
+            structure_delete(e, &e->structs[i]);
+}
+
+/* hasUnitNearby(tile, range, DefensePost, defender): completed posts only,
+   Euclidean inclusive (spec 2.4, 17.1). */
+static int defended_by_post(Env *e, int defender, int t) {
+    if (defender == 0 || e->players[defender].n_struct == 0) return 0;
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (!s->alive || s->owner != defender || s->type != STRUCT_POST) continue;
+        if (s->build_left == 0 && tile_d2(s->tile, t) <= POST_RANGE * POST_RANGE)
+            return 1;
+    }
+    return 0;
 }
 
 // economy
@@ -760,8 +950,11 @@ static inline double cap_pow(Env *e, int n) {
     return e->cap_pow[n];
 }
 
+/* With no cities the added term is +0.0, and m + 0.0 == m exactly for any
+   m != -0.0; m >= 100000 here. So the zero-city result is bit-identical. */
 static double max_troops(Env *e, int p) {
-    double m = 2.0 * (cap_pow(e, e->players[p].tiles.count) * 1000.0 + 50000.0);
+    double m = 2.0 * (cap_pow(e, e->players[p].tiles.count) * 1000.0 + 50000.0)
+             + (double)e->players[p].cities * CITY_TROOP_BONUS;
     if (e->is_bot[p]) m /= 3.0;
     return m;
 }
@@ -775,10 +968,16 @@ static int64_t gold_rate(Env *e, int p) {
     return (int64_t)floor(base * GOLD_MULT);
 }
 
-/* PlayerExecution.tick (spec 6.1): death (3), troop growth (4), gold (5).
-   Annexation (8) is annex_tick, called right after this by sim_tick. */
+/* PlayerExecution.tick (spec 6.1): structure capture (2), death (3), troop
+   growth (4), gold (5). Annexation (8) is annex_tick, called right after this
+   by sim_tick. */
 static void player_tick(Env *e, int p) {
-    if (!e->players[p].alive) { e->players[p].gold = 0; return; }
+    structures_tick(e, p);
+    if (!e->players[p].alive) {
+        e->players[p].gold = 0;
+        structures_delete_all(e, p);
+        return;
+    }
     double max = max_troops(e, p);
     double t = (double)e->players[p].troops;
     double add = 10.0 + det_pow(t, 0.73) / 4.0;
@@ -1027,7 +1226,7 @@ static void attack_tick(Env *e, Attack *a) {
                                    tp != 0, tp ? e->is_bot[tp] : 0,
                                    def_n, lt_sig(e, def_n),
                                    tp ? (double)e->players[tp].troops : 0.0,
-                                   0, bs);
+                                   defended_by_post(e, tp, t), bs);
         tick_budget -= r.frac;
         a->troops -= r.atk_loss;
         if (a->troops < 0.0) a->troops = 0.0;
@@ -1376,15 +1575,23 @@ static int largest_incoming_attacker(Env *e, int p) {
     return best;
 }
 
+/* calculateAttackTroops, land, bot attacker (spec 14.2): the reserve ratio,
+   except the expand ratio against a Bot that owns any structure. Upstream's
+   test is units().some(Structures.has): under construction and marked count. */
+static double bot_send(Env *e, int p, int target) {
+    int use_reserve = !(e->is_bot[target] && e->players[target].n_struct > 0);
+    double ratio = use_reserve ? e->bots[p].reserve_ratio : e->bots[p].expand_ratio;
+    return (double)e->players[p].troops - max_troops(e, p) * ratio;
+}
+
+/* After the gate, troops >= trigger * max, so bot_send >= (trigger - reserve)
+   * max >= 0.11 * max > 1 for either ratio: sendAttack never refuses here. */
 static void bot_attack_random(Env *e, int p) {
     if ((double)e->players[p].troops < e->bots[p].trigger_ratio * max_troops(e, p)) return;
 
-    double send = (double)e->players[p].troops - max_troops(e, p) * e->bots[p].reserve_ratio;
-    if (send < 1.0) return;
-
     int r = largest_incoming_attacker(e, p);
     if (r != 0) {
-        attack_start(e, p, r, send);
+        attack_start(e, p, r, bot_send(e, p, r));
         return;
     }
 
@@ -1399,7 +1606,23 @@ static void bot_attack_random(Env *e, int p) {
     for (int i = 0; i < count; i++) {
         int q = cand[i];
         if (!e->is_bot[q] && rng_below(e, 2) == 0) continue;
-        attack_start(e, p, q, send);
+        attack_start(e, p, q, bot_send(e, p, q));
+        return;
+    }
+}
+
+/* TribeExecution.deleteNextStructure (spec 14 step 2, TribeExecution.ts:86):
+   request the first unmarked structure. The mark itself is DeleteUnitExecution
+   .init, applied at end of tick by structures_end_tick. Scan order is slot
+   order; upstream's is units() order, which may differ after captures. */
+static void bot_delete_next(Env *e, int p) {
+    Player *pl = &e->players[p];
+    if (pl->n_struct == 0) return;
+    if (e->ticks - pl->last_delete_tick < DELETE_COOLDOWN) return;
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (!s->alive || s->owner != p || s->marked_at >= 0) continue;
+        pl->delete_req = i;
         return;
     }
 }
@@ -1407,6 +1630,12 @@ static void bot_attack_random(Env *e, int p) {
 static void bot_tick(Env *e, int p) {
     if (!e->players[p].alive) return;
     if (e->ticks % e->bots[p].attack_rate != e->bots[p].attack_off) return;
+
+    /* Upstream's first decision is the TN attack alone; deletion starts on
+       the later ones. The first decision tick is attack_off, or attack_rate
+       when attack_off is 0 (ticks start at 1). */
+    int first = e->bots[p].attack_off ? e->bots[p].attack_off : e->bots[p].attack_rate;
+    if (e->ticks > first) bot_delete_next(e, p);
 
     if (e->bots[p].neighbors_tn) {
         if (has_tn_neighbor(e, p)) {
@@ -1550,6 +1779,7 @@ static int sim_tick(Env *e) {
     for (int i = 0; i < MAXATK; i++)
         if (e->attacks[i].active) attack_tick(e, &e->attacks[i]);
     for (int p = 1; p < MAXP; p++) { player_tick(e, p); annex_tick(e, p); }
+    structures_end_tick(e);
     if (e->ticks % 50 == 0) check_borders(e);
     if (e->ticks % 10 == 0) return win_check(e);
     return 0;
@@ -1623,6 +1853,45 @@ static void check_borders(Env *e) {
         if (pop != e->attacks[i].border_size) {
             printf("ATTACK BORDER BROKEN: slot %d size=%d pop=%d\n",
                    i, e->attacks[i].border_size, pop);
+            exit(1);
+        }
+    }
+    int n_struct[MAXP], cities[MAXP];
+    memset(n_struct, 0, sizeof(n_struct));
+    memset(cities, 0, sizeof(cities));
+    for (int i = 0; i < MAXSTRUCT; i++) {
+        Structure *s = &e->structs[i];
+        if (!s->alive) continue;
+        if (i >= e->struct_hw) {
+            printf("STRUCT BROKEN: live slot %d >= hw %d\n", i, e->struct_hw);
+            exit(1);
+        }
+        if (!is_land(e, s->tile) || s->build_left < 0 || s->owner < 1 || s->owner >= MAXP) {
+            printf("STRUCT BROKEN: slot %d tile %d owner %d build_left %d\n",
+                   i, s->tile, s->owner, s->build_left);
+            exit(1);
+        }
+        /* The owner's capture pass ran this tick; only a tile change after it
+           (annexation, a later player's pass) can leave a mismatch. */
+        if (e->owner[s->tile] != s->owner && e->last_tile_change[s->owner] != e->ticks) {
+            printf("STRUCT OWNER BROKEN: slot %d owner %d tile owner %d\n",
+                   i, s->owner, e->owner[s->tile]);
+            exit(1);
+        }
+        n_struct[s->owner]++;
+        if (s->type == STRUCT_CITY && s->build_left == 0) cities[s->owner]++;
+        for (int j = i + 1; j < MAXSTRUCT; j++) {
+            if (!e->structs[j].alive) continue;
+            if (tile_d2(s->tile, e->structs[j].tile) < STRUCT_MIN_DIST * STRUCT_MIN_DIST) {
+                printf("STRUCT MIN-DIST BROKEN: slots %d %d\n", i, j);
+                exit(1);
+            }
+        }
+    }
+    for (int p = 0; p < MAXP; p++) {
+        if (n_struct[p] != e->players[p].n_struct || cities[p] != e->players[p].cities) {
+            printf("STRUCT COUNT BROKEN: p%d n_struct %d/%d cities %d/%d\n", p,
+                   e->players[p].n_struct, n_struct[p], e->players[p].cities, cities[p]);
             exit(1);
         }
     }
@@ -1887,6 +2156,18 @@ static unsigned long env_hash(Env *e) {
         h = (h ^ (unsigned long)e->players[p].alive) * 1099511628211UL;
         h = (h ^ (uint64_t)e->players[p].gold) * 1099511628211UL;
         h = (h ^ (unsigned long)e->players[p].sent_attack) * 1099511628211UL;
+        h = (h ^ (unsigned long)e->players[p].last_delete_tick) * 1099511628211UL;
+        for (int k = 0; k < STRUCT_TYPES; k++)
+            h = (h ^ (unsigned long)e->players[p].units_constructed[k]) * 1099511628211UL;
+    }
+    for (int i = 0; i < e->struct_hw; i++) {
+        Structure *s = &e->structs[i];
+        if (!s->alive) continue;
+        h = (h ^ (unsigned long)(i * 4 + s->type)) * 1099511628211UL;
+        h = (h ^ (unsigned long)s->owner) * 1099511628211UL;
+        h = (h ^ (unsigned long)s->tile) * 1099511628211UL;
+        h = (h ^ (unsigned long)s->build_left) * 1099511628211UL;
+        h = (h ^ (unsigned long)s->marked_at) * 1099511628211UL;
     }
     for (int i = 0; i < MAXATK; i++) {
         if (!e->attacks[i].active) continue;
@@ -2417,6 +2698,364 @@ static void gold_test(void) {
     free(e);
 }
 
+static void struct_expect(const char *what, int64_t got, int64_t want) {
+    if (got == want) return;
+    printf("STRUCT TEST BROKEN: %s: got %" PRId64 " want %" PRId64 "\n", what, got, want);
+    exit(1);
+}
+
+static void struct_expect_near(const char *what, double got, double want) {
+    if (fabs(got - want) <= 1e-6) return;
+    printf("STRUCT TEST BROKEN: %s: got %.17g want %.17g\n", what, got, want);
+    exit(1);
+}
+
+static void struct_reset(Env *e) {
+    memset(e->terrain, OF_LAND_BIT | 5, sizeof(e->terrain));
+    e->land_tiles = OF_N;
+    players_reset(e);
+    for (int i = 0; i < MAXATK; i++) e->attacks[i].active = 0;
+    e->ticks = 100;
+}
+
+/* Slot of the live structure on tile t, or -1. */
+static int struct_at(Env *e, int t) {
+    for (int i = 0; i < e->struct_hw; i++)
+        if (e->structs[i].alive && e->structs[i].tile == t) return i;
+    return -1;
+}
+
+/* sim_tick without attacks or annexation: bots decide, players tick, then
+   the end-of-tick pass. */
+static void struct_tick(Env *e) {
+    e->ticks++;
+    for (int p = 1; p < MAXP; p++) if (e->is_bot[p]) bot_tick(e, p);
+    for (int p = 1; p < MAXP; p++) player_tick(e, p);
+    structures_end_tick(e);
+}
+
+/* A bot that decides every tick and never attacks. */
+static void struct_idle_bot(Env *e, int p) {
+    e->bots[p].attack_rate = 1;
+    e->bots[p].attack_off = 0;
+    e->bots[p].neighbors_tn = 0;
+    e->bots[p].trigger_ratio = 0.5;
+    troops_set(e, p, 0.0);
+}
+
+static void structure_test(void) {
+    Env *e = test_env(7);
+    Player *pl = e->players;
+
+    /* Cost sequences, including both caps (spec 15.3). */
+    struct_reset(e);
+    fill_rect(e, 1, 2, 2, 40, 20);
+    e->is_bot[1] = 0;
+    pl[1].gold = 100000000;
+    const int64_t city_cost[6] = {125000, 250000, 500000, 1000000, 1000000, 1000000};
+    const int64_t post_cost[7] = {50000, 100000, 150000, 200000, 250000, 250000, 250000};
+    for (int k = 0; k < 6; k++) {
+        int64_t g = pl[1].gold;
+        struct_expect("city cost", structure_cost(e, 1, STRUCT_CITY), city_cost[k]);
+        struct_expect("city built", build_structure(e, 1, STRUCT_CITY, ref(3 + 3*k, 3)), 1);
+        struct_expect("city deducted", g - pl[1].gold, city_cost[k]);
+    }
+    for (int k = 0; k < 7; k++) {
+        int64_t g = pl[1].gold;
+        struct_expect("post cost", structure_cost(e, 1, STRUCT_POST), post_cost[k]);
+        struct_expect("post built", build_structure(e, 1, STRUCT_POST, ref(3 + 3*k, 10)), 1);
+        struct_expect("post deducted", g - pl[1].gold, post_cost[k]);
+    }
+    struct_expect("constructed cities", pl[1].units_constructed[STRUCT_CITY], 6);
+    struct_expect("constructed posts", pl[1].units_constructed[STRUCT_POST], 7);
+    check_borders(e);
+
+    /* Refusals. Every one leaves gold untouched. */
+    int64_t g = pl[1].gold;
+    pl[1].gold = 999;
+    struct_expect("poor", build_structure(e, 1, STRUCT_POST, ref(30, 15)), 0);
+    struct_expect("poor: gold", pl[1].gold, 999);
+    pl[1].gold = g;
+    struct_expect("unowned", build_structure(e, 1, STRUCT_POST, ref(45, 45)), 0);
+    fill_rect(e, 2, 44, 30, 3, 3);
+    struct_expect("other's tile", build_structure(e, 1, STRUCT_POST, ref(45, 31)), 0);
+    e->terrain[ref(45, 40)] = OF_OCEAN_BIT | 1;   /* water is never owned */
+    struct_expect("water", build_structure(e, 1, STRUCT_POST, ref(45, 40)), 0);
+    struct_expect("blocker", build_structure(e, 1, STRUCT_POST, ref(30, 15)), 1);
+    g = pl[1].gold;
+    struct_expect("blocked d2=8", build_structure(e, 1, STRUCT_POST, ref(32, 17)), 0);
+    struct_expect("blocked: gold", pl[1].gold, g);
+    struct_expect("allowed d2=9", build_structure(e, 1, STRUCT_POST, ref(33, 15)), 1);
+    pl[2].gold = 1000000;
+    struct_expect("p2 post", build_structure(e, 2, STRUCT_POST, ref(45, 31)), 1);
+    conquer(e, 1, ref(43, 31));
+    g = pl[1].gold;
+    struct_expect("blocked by other owner", build_structure(e, 1, STRUCT_POST, ref(43, 31)), 0);
+    struct_expect("other owner: gold", pl[1].gold, g);
+    check_borders(e);
+
+    /* Slot exhaustion, forced: at 48x48 with min-dist 3 fewer than ~170
+       structures fit, so MAXSTRUCT is unreachable through placement. */
+    struct_reset(e);
+    fill_rect(e, 1, 20, 20, 5, 5);
+    pl[1].gold = 1000000;
+    for (int i = 0; i < MAXSTRUCT; i++) {
+        e->structs[i].type = STRUCT_POST;
+        e->structs[i].owner = 2;
+        e->structs[i].tile = ref(0, 0);
+        e->structs[i].build_left = 0;
+        e->structs[i].marked_at = -1;
+        e->structs[i].alive = 1;
+    }
+    e->struct_hw = MAXSTRUCT;
+    long drops = e->struct_full_drops;
+    struct_expect("slots full", build_structure(e, 1, STRUCT_POST, ref(22, 22)), 0);
+    struct_expect("slots full: drops", e->struct_full_drops, drops + 1);
+    struct_expect("slots full: gold", pl[1].gold, 1000000);
+
+    /* Construction: created on tick B, complete on B + D + 1
+       (ConstructionExecution.ts:91-97). A city captured mid-build keeps its
+       timer and loses its mark; the bonus goes to the new owner. */
+    struct_reset(e);
+    fill_rect(e, 1, 10, 10, 10, 10);
+    fill_rect(e, 2, 20, 10, 10, 10);
+    e->is_bot[1] = 0;
+    e->is_bot[2] = 0;
+    pl[1].gold = 1000000;
+    int c = ref(15, 15);
+    const long B = e->ticks;
+    struct_expect("city", build_structure(e, 1, STRUCT_CITY, c), 1);
+    int si = struct_at(e, c);
+    while (e->ticks < B + 5) struct_tick(e);
+    struct_expect("B+5: left", e->structs[si].build_left, 16);
+    e->structs[si].marked_at = 90;
+    conquer(e, 2, c);
+    struct_tick(e);
+    struct_expect("captured: owner", e->structs[si].owner, 2);
+    struct_expect("captured: timer", e->structs[si].build_left, 15);
+    struct_expect("captured: mark", e->structs[si].marked_at, -1);
+    check_borders(e);
+    /* min(owned, constructed): p1 constructed 1 and owns 0; p2 owns 1 and
+       constructed 0. Both are at n = 0. */
+    struct_expect("min: p1 cost", structure_cost(e, 1, STRUCT_CITY), 125000);
+    struct_expect("min: p2 cost", structure_cost(e, 2, STRUCT_CITY), 125000);
+    double m_before = max_troops(e, 2);
+    while (e->ticks < B + CITY_BUILD_TICKS) struct_tick(e);
+    struct_expect("B+D: not complete", pl[2].cities, 0);
+    struct_expect("B+D: left", e->structs[si].build_left, 1);
+    struct_tick(e);
+    struct_expect("B+D+1: p2 cities", pl[2].cities, 1);
+    struct_expect("B+D+1: p1 cities", pl[1].cities, 0);
+    struct_expect_near("human bonus", max_troops(e, 2) - m_before, 25000.0);
+    e->is_bot[2] = 1;
+    double with = max_troops(e, 2);
+    pl[2].cities = 0;
+    double without = max_troops(e, 2);
+    pl[2].cities = 1;
+    struct_expect_near("bot bonus", with - without, 25000.0 / 3.0);
+    e->is_bot[2] = 0;
+    pl[2].gold = 1000000;
+    struct_expect("p2 builds", build_structure(e, 2, STRUCT_CITY, ref(25, 15)), 1);
+    struct_expect("min: p2 next", structure_cost(e, 2, STRUCT_CITY), 250000);
+    check_borders(e);
+
+    /* A post is destroyed, not captured. */
+    pl[1].gold = 1000000;
+    int pt = ref(12, 12);
+    struct_expect("post", build_structure(e, 1, STRUCT_POST, pt), 1);
+    conquer(e, 2, pt);
+    player_tick(e, 1);
+    struct_expect("post destroyed", struct_at(e, pt), -1);
+    struct_expect("post destroyed: p1 n_struct", pl[1].n_struct, 0);
+    check_borders(e);
+
+    /* A structure on a tile that goes unowned is deleted. Forced: nothing
+       relinquishes a tile until nukes. */
+    int ut = ref(18, 18);
+    struct_expect("unowned post", build_structure(e, 1, STRUCT_POST, ut), 1);
+    e->owner[ut] = 0;
+    structures_tick(e, 1);
+    e->owner[ut] = 1;
+    struct_expect("unowned: deleted", struct_at(e, ut), -1);
+
+    /* Owner death. Realistic path: every tile of p3 goes to p1, so the
+       capture pass moves the city and destroys the post. */
+    struct_reset(e);
+    fill_rect(e, 1, 10, 10, 10, 10);
+    fill_rect(e, 3, 30, 10, 5, 5);
+    pl[3].gold = 1000000;
+    struct_expect("p3 city", build_structure(e, 3, STRUCT_CITY, ref(31, 11)), 1);
+    struct_expect("p3 post", build_structure(e, 3, STRUCT_POST, ref(34, 13)), 1);
+    fill_rect(e, 1, 30, 10, 5, 5);
+    player_tick(e, 3);
+    struct_expect("death: p3 n_struct", pl[3].n_struct, 0);
+    struct_expect("death: city to p1", e->structs[struct_at(e, ref(31, 11))].owner, 1);
+    struct_expect("death: post gone", struct_at(e, ref(34, 13)), -1);
+    struct_expect("death: gold", pl[3].gold, 0);
+    check_borders(e);
+    /* The death step itself, forced (unreachable through the sim). */
+    fill_rect(e, 3, 36, 20, 3, 3);
+    pl[3].gold = 1000000;
+    struct_expect("p3 city 2", build_structure(e, 3, STRUCT_CITY, ref(37, 21)), 1);
+    pl[3].alive = 0;
+    player_tick(e, 3);
+    pl[3].alive = 1;
+    struct_expect("death step: deleted", struct_at(e, ref(37, 21)), -1);
+    struct_expect("death step: n_struct", pl[3].n_struct, 0);
+
+    /* Post: completed only (B + 51), d2 <= 36 inclusive. */
+    struct_reset(e);
+    fill_rect(e, 1, 5, 15, 10, 11);
+    fill_rect(e, 2, 15, 15, 12, 11);
+    e->is_bot[1] = 0;
+    e->is_bot[2] = 0;
+    pl[2].gold = 1000000;
+    int post = ref(18, 20);
+    const long BP = e->ticks;
+    struct_expect("range post", build_structure(e, 2, STRUCT_POST, post), 1);
+    while (e->ticks < BP + POST_BUILD_TICKS) struct_tick(e);
+    struct_expect("B+50: not complete", defended_by_post(e, 2, ref(24, 20)), 0);
+    struct_tick(e);
+    struct_expect("B+51: complete", e->structs[struct_at(e, post)].build_left, 0);
+    struct_expect("d2=36", defended_by_post(e, 2, ref(24, 20)), 1);
+    struct_expect("d2=37", defended_by_post(e, 2, ref(24, 21)), 0);
+    struct_expect("not p1's post", defended_by_post(e, 1, ref(24, 20)), 0);
+    /* Through attack_tick: the same attack, with and without the post. The
+       whole front (x = 15, y = 15..25) is within range of (18, 20). */
+    Env *e2 = (Env*)malloc(sizeof(Env));
+    if (!e2) { printf("structure_test: oom\n"); exit(1); }
+    memcpy(e2, e, sizeof(Env));
+    structure_delete(e2, &e2->structs[struct_at(e2, post)]);
+    troops_set(e, 1, 100000.0);
+    troops_set(e2, 1, 100000.0);
+    troops_set(e, 2, 50000.0);
+    troops_set(e2, 2, 50000.0);
+    attack_start(e, 1, 2, 60000.0);
+    attack_start(e2, 1, 2, 60000.0);
+    attack_tick(e, &e->attacks[0]);
+    attack_tick(e2, &e2->attacks[0]);
+    if (!(e->attacks[0].troops < e2->attacks[0].troops)) {
+        printf("STRUCT TEST BROKEN: post did not raise attacker loss (%.17g vs %.17g)\n",
+               e->attacks[0].troops, e2->attacks[0].troops);
+        exit(1);
+    }
+    free(e2);
+
+    /* Bot scrapping (spec 14 step 2, 15.7). last_delete_tick starts at -1, so
+       the first mark is on tick 299; the mark lands at end of tick; deletion
+       is at mark + 301; the next mark is 300 after the last. */
+    struct_reset(e);
+    fill_rect(e, 2, 10, 10, 10, 10);
+    fill_rect(e, 1, 20, 10, 10, 10);
+    e->is_bot[1] = 0;
+    pl[2].gold = 1000000;
+    int b0 = ref(12, 12), b1 = ref(16, 16);
+    struct_expect("bot city 0", build_structure(e, 2, STRUCT_CITY, b0), 1);
+    struct_expect("bot city 1", build_structure(e, 2, STRUCT_CITY, b1), 1);
+    struct_idle_bot(e, 2);
+    e->ticks = 297;
+    struct_tick(e);
+    struct_expect("298: cooldown", e->structs[struct_at(e, b0)].marked_at, -1);
+    struct_tick(e);
+    struct_expect("299: marked", e->structs[struct_at(e, b0)].marked_at, 299);
+    struct_expect("299: cooldown start", pl[2].last_delete_tick, 299);
+    struct_expect("299: second unmarked", e->structs[struct_at(e, b1)].marked_at, -1);
+    while (e->ticks < 598) struct_tick(e);
+    struct_expect("598: second unmarked", e->structs[struct_at(e, b1)].marked_at, -1);
+    struct_tick(e);
+    struct_expect("599: second marked", e->structs[struct_at(e, b1)].marked_at, 599);
+    struct_expect("599 = mark+300: alive", struct_at(e, b0) >= 0, 1);
+    struct_tick(e);
+    struct_expect("600 = mark+301: deleted", struct_at(e, b0), -1);
+    check_borders(e);
+    /* Capture clears the mark; the captured city outlives its deadline. */
+    e->ticks = 700;
+    conquer(e, 1, b1);
+    struct_tick(e);
+    struct_expect("capture clears mark", e->structs[struct_at(e, b1)].marked_at, -1);
+    while (e->ticks < 950) struct_tick(e);
+    struct_expect("captured survives", e->structs[struct_at(e, b1)].owner, 1);
+    check_borders(e);
+
+    /* Mark at end of tick: a structure captured in the same tick as the
+       request is not marked, and the cooldown is not spent. */
+    struct_reset(e);
+    fill_rect(e, 2, 10, 10, 10, 10);
+    fill_rect(e, 1, 20, 10, 10, 10);
+    e->is_bot[1] = 0;
+    pl[2].gold = 1000000;
+    struct_expect("bot city 3", build_structure(e, 2, STRUCT_CITY, b0), 1);
+    struct_idle_bot(e, 2);
+    e->ticks = 1000;
+    e->ticks++;
+    bot_tick(e, 2);
+    struct_expect("request made", pl[2].delete_req, struct_at(e, b0));
+    conquer(e, 1, b0);
+    for (int p = 1; p < MAXP; p++) player_tick(e, p);
+    structures_end_tick(e);
+    struct_expect("same-tick capture: owner", e->structs[struct_at(e, b0)].owner, 1);
+    struct_expect("same-tick capture: unmarked", e->structs[struct_at(e, b0)].marked_at, -1);
+    struct_expect("same-tick capture: no cooldown", pl[2].last_delete_tick, -1);
+    struct_expect("request cleared", pl[2].delete_req, -1);
+
+    /* No scrapping on the first decision (tick attack_off, or attack_rate). */
+    struct_reset(e);
+    fill_rect(e, 2, 10, 10, 10, 10);
+    pl[2].gold = 1000000;
+    struct_expect("bot city 4", build_structure(e, 2, STRUCT_CITY, b0), 1);
+    struct_idle_bot(e, 2);
+    e->bots[2].attack_rate = 10;
+    e->bots[2].attack_off = 5;
+    pl[2].last_delete_tick = -1000;
+    e->ticks = 4;
+    struct_tick(e);
+    struct_expect("first decision (5)", e->structs[struct_at(e, b0)].marked_at, -1);
+    while (e->ticks < 15) struct_tick(e);
+    struct_expect("later decision (15)", e->structs[struct_at(e, b0)].marked_at, 15);
+
+    /* 14.2: the expand ratio against a Bot that owns a structure. */
+    fill_rect(e, 1, 20, 10, 10, 10);
+    pl[1].gold = 1000000;
+    struct_expect("p1 city", build_structure(e, 1, STRUCT_CITY, ref(25, 15)), 1);
+    e->is_bot[1] = 0;
+    e->bots[2].reserve_ratio = 0.3;
+    e->bots[2].expand_ratio = 0.1;
+    troops_set(e, 2, 100000.0);
+    double mx = max_troops(e, 2);
+    struct_expect_near("vs human with city", bot_send(e, 2, 1), 100000.0 - mx * 0.3);
+    e->is_bot[1] = 1;
+    struct_expect_near("vs bot with city", bot_send(e, 2, 1), 100000.0 - mx * 0.1);
+    struct_expect_near("vs bot without", bot_send(e, 2, 3), 100000.0 - mx * 0.3);
+
+    /* The same construction timing through the real sim_tick. Two islands,
+       so no bot has a target. */
+    memset(e->terrain, OF_OCEAN_BIT | 1, sizeof(e->terrain));
+    for (int y = 0; y < 5; y++)
+        for (int x = 0; x < 5; x++) {
+            e->terrain[ref(10 + x, 10 + y)] = OF_LAND_BIT | 5;
+            e->terrain[ref(30 + x, 30 + y)] = OF_LAND_BIT | 5;
+        }
+    e->land_tiles = 50;
+    players_reset(e);
+    bots_init(e);
+    for (int i = 0; i < MAXATK; i++) e->attacks[i].active = 0;
+    fill_rect(e, 1, 10, 10, 5, 5);
+    fill_rect(e, 2, 30, 30, 5, 5);
+    e->is_bot[1] = 0;
+    troops_set(e, 1, start_troops(e, 1));
+    troops_set(e, 2, start_troops(e, 2));
+    pl[1].gold = 1000000;
+    e->ticks = 100;
+    struct_expect("sim_tick city", build_structure(e, 1, STRUCT_CITY, ref(12, 12)), 1);
+    for (int k = 0; k < CITY_BUILD_TICKS; k++) sim_tick(e);
+    struct_expect("sim_tick B+D", pl[1].cities, 0);
+    sim_tick(e);
+    struct_expect("sim_tick B+D+1", pl[1].cities, 1);
+
+    printf("structures ok: costs, refusals, timing, capture, death, post range, scrapping\n");
+    free(e);
+}
+
 static void run_tests(void) {
     ts_test();
     conquer_test();
@@ -2430,6 +3069,7 @@ static void run_tests(void) {
     map_test();
     annex_shore_test();
     gold_test();
+    structure_test();
 }
 #else
 static void run_tests(void) {}
